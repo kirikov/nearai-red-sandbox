@@ -300,6 +300,15 @@ impl StateDir {
         f.lock()?;
         Ok(f)
     }
+
+    /// A shared hold on the exec lock: execs that need no serialization
+    /// among themselves still keep `quiesce` waiting until they finish.
+    pub(crate) fn lock_shared(&self) -> io::Result<File> {
+        fs::create_dir_all(&self.0)?;
+        let f = OpenOptions::new().create(true).truncate(false).write(true).open(self.0.join("exec.lock"))?;
+        f.lock_shared()?;
+        Ok(f)
+    }
 }
 
 pub struct MvmSandbox {

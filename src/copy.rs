@@ -35,7 +35,9 @@ fn long() -> ExecOptions {
     ExecOptions::new(300_000, 16_384)
 }
 
-const UNPACK: &str = r#"mkdir -p -- "$1" && tar -xf "$2" -C "$1"; s=$?; rm -f -- "$2"; exit $s"#;
+// -o: never restore the archive's owner; a guest without CAP_CHOWN (the
+// container backend) would otherwise fail on every entry.
+const UNPACK: &str = r#"mkdir -p -- "$1" && tar -xof "$2" -C "$1"; s=$?; rm -f -- "$2"; exit $s"#;
 
 const PACK: &str = r#"d=$1; t=$2
 if [ ! -d "$d" ]; then echo NONE; exit 0; fi

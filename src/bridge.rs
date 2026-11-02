@@ -211,7 +211,7 @@ pub fn run(tool: &str) -> Outcome {
             match DockerSandbox::new(&o.machine, Box::new(runner))
                 .and_then(|sb| sb.with_runtime(o.runtime.clone()))
             {
-                Ok(sb) => Box::new(sb),
+                Ok(sb) => Box::new(sb.with_state(StateDir(o.state_dir.clone()))),
                 Err(e) => return Outcome::fail(EXIT_BAD_REQUEST, e.to_string()),
             }
         }

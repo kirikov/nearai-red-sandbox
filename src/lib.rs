@@ -6,6 +6,7 @@ pub mod inference;
 pub(crate) mod json;
 pub mod config;
 pub mod forwarder;
+pub mod headless;
 pub mod copy;
 pub mod docker;
 pub mod files;

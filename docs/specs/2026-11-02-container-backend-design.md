@@ -1,7 +1,7 @@
 # Container backend for Linux hosts: design
 
 Date: 2026-11-02
-Status: proposed; first increment implemented as `src/docker.rs` behind the existing `Sandbox` seam.
+Status: proposed; implemented as `src/docker.rs` behind the existing `Sandbox` seam, with the headless session in `src/headless.rs` (`rts run`).
 
 ## Purpose
 
@@ -36,10 +36,14 @@ product is unchanged.
 | Exec semantics | No serialization: Docker does not journal execs and a nonzero guest exit does not poison the container. A missing trailer, a host-backstop kill, or a daemon error naming a gone container marks the sandbox unavailable for good, as mvm does. |
 | Bridge | `rts tool` takes `bridge.backend: "mvm" \| "docker"` (default `mvm`), `docker` (CLI path) and `runtime`. `mvmctl` and `emptyGitConfig` are required only for mvm. The plugin passes the object through unchanged. |
 | Tests | Unit tests with a fake runner mirror `mvm.rs`. `tests/container.rs` runs the containment checks against a real daemon, ignored by default, prerequisites fail loudly. |
+| State dir | The container sandbox shares the session's state directory like mvm: any process's unavailable marker refuses later execs, and execs hold the exec lock shared (no serialization among themselves) so teardown's exclusive `quiesce` still waits for them. |
+| copyIn | The guest tar extracts with `-o`: a container without `CAP_CHOWN` cannot restore the archive's owner, and both busybox and GNU tar accept the flag. |
+| Headless session | `rts run --image REF --prompt-file FILE [--inputs DIR] [--docker PATH] [--runtime NAME] [--timeout-min N] --allow-unattested-provider`: the session file supplies provider, limits, opencode and the plugin; the sandbox is a container with no network; `opencode run --standalone --format json --auto` runs the prompt once; its JSON events land in `sessions/<id>/opencode.jsonl`; `/out` is exported at teardown and `session.json` records the outcome. An explicit provider is required: the attested embedded provider (IronWire and the pinned forwarder) is not wired for headless yet, so the run is recorded unattested like `rts launch --allow-unattested-provider`. |
 
 ## Not in this increment
 
-- A headless session (`rts run`): the launcher still assumes the TUI and the
-  mvm preflight. It is the next change on this branch.
-- Orphan sweep and RSS ceiling for containers in the session loop.
+- Attested inference for the headless session (the forwarder and IronWire
+  start on the `launch` path only).
+- An RSS ceiling for containers in the session loop; the orphan sweep only
+  logs `rts-*` containers it finds, as the mvm sweep does.
 - Building the guest image for Linux in CI and publishing its digest.

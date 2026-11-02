@@ -36,6 +36,11 @@ enum Action {
     Setup(setup::SetupOptions),
     Update(rts::update::apply::UpdateOptions),
     Tool(String),
+    Run {
+        file: Option<PathBuf>,
+        options: rts::headless::RunOptions,
+        allow_unattested_provider: bool,
+    },
     Login(auth::LoginOptions),
     Launch {
         file: Option<PathBuf>,
@@ -62,6 +67,9 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     }
     if let ["tool", name] = args {
         return Ok(Action::Tool((*name).into()));
+    }
+    if let ["run", flags @ ..] = args {
+        return parse_run(flags);
     }
     let (command, flags) = args.split_first().ok_or("Expected a command")?;
     if !matches!(*command, "launch" | "login") {
@@ -237,6 +245,106 @@ fn parse_update(flags: &[&str]) -> Result<Action, String> {
     Ok(Action::Update(o))
 }
 
+/// `rts run`: a headless session on the container backend. Every value
+/// flag is required once except --inputs, --docker, --runtime and
+/// --timeout-min.
+fn parse_run(flags: &[&str]) -> Result<Action, String> {
+    if flags.iter().any(|flag| matches!(*flag, "--help" | "-h")) {
+        return Ok(Action::Help);
+    }
+    let mut file = None;
+    let mut image = None;
+    let mut inputs = None;
+    let mut prompt_file = None;
+    let mut docker = None;
+    let mut runtime = None;
+    let mut timeout_min = None;
+    let mut allow_unattested_provider = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut flags = flags.iter();
+    while let Some(&flag) = flags.next() {
+        if !seen.insert(flag) {
+            return Err(format!("Duplicate option: {flag}"));
+        }
+        if flag == "--allow-unattested-provider" {
+            allow_unattested_provider = true;
+            continue;
+        }
+        let value = flags
+            .next()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag {
+            "--config" => file = Some(PathBuf::from(value)),
+            "--image" => image = Some(value.to_string()),
+            "--inputs" => inputs = Some(PathBuf::from(value)),
+            "--prompt-file" => prompt_file = Some(PathBuf::from(value)),
+            "--docker" => docker = Some(PathBuf::from(value)),
+            "--runtime" => runtime = Some(value.to_string()),
+            "--timeout-min" => {
+                timeout_min = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|m| (1..=24 * 60).contains(m))
+                        .ok_or("--timeout-min must be a number of minutes from 1 to 1440")?,
+                )
+            }
+            _ => return Err(format!("Unknown option for run: {flag}")),
+        }
+    }
+    let options = rts::headless::RunOptions {
+        image: image.ok_or("run needs --image (name@sha256:… or sha256:…)")?,
+        inputs,
+        prompt_file: prompt_file.ok_or("run needs --prompt-file")?,
+        docker,
+        runtime,
+        timeout_min: timeout_min.unwrap_or(rts::headless::DEFAULT_TIMEOUT_MIN),
+    };
+    Ok(Action::Run {
+        file,
+        options,
+        allow_unattested_provider,
+    })
+}
+
+/// `rts run`: load the session file, apply the launch checks, and run the
+/// headless session. An external provider is recorded as unattested the
+/// same way `rts launch` records it; the attested embedded provider is not
+/// available headless yet.
+fn run_headless_command(
+    file: Option<&Path>,
+    options: &rts::headless::RunOptions,
+    allow_unattested_provider: bool,
+) -> Result<i32, String> {
+    let defaults = config::Defaults::from_env();
+    let cfg = if let Some(file) = file {
+        config::load_config(file, &defaults)?
+    } else {
+        config::parse_config(
+            "{}",
+            &std::env::current_dir().map_err(|_| "Cannot determine current directory")?,
+            &defaults,
+        )?
+    };
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let attest_options = attest::AttestOptions {
+        allow_unattested_provider,
+        ..Default::default()
+    };
+    check_launch(&cfg, &env, &attest_options)?;
+    if cfg.embedded_inference {
+        return Err("rts run needs an explicit provider in the session file (provider.id, baseURL, models, apiKeyEnv) and --allow-unattested-provider; the attested embedded provider is not available headless yet".into());
+    }
+    if !cfg.network.is_empty() {
+        return Err("rts run gives the container no network; remove network.allow from the session file".into());
+    }
+    let session_id = session::new_session_id();
+    record_unattested(&cfg, &session_id, &attest_options)?;
+    let deps = session::Deps::real(session_id, None)?;
+    Ok(rts::headless::run_headless(&cfg, options, deps))
+}
+
 fn run_connected<G>(
     cfg: &mut config::OperatorConfig,
     preflight: impl FnOnce(&config::OperatorConfig) -> Result<(), String>,
@@ -254,7 +362,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts run --image REF --prompt-file FILE [--config PATH] [--inputs DIR] [--docker PATH]\n               [--runtime NAME] [--timeout-min N] --allow-unattested-provider\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\nrts run is the headless session for a Linux host (a confidential VM): the sandbox is a container\n(REF is name@sha256:… or sha256:…, no network), opencode runs the prompt file once and exits, and\n/out lands in sessions/<id>/out. It needs an explicit provider in the session file.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -596,6 +704,11 @@ fn main() -> ExitCode {
             }
             return code(out.code);
         }
+        Action::Run {
+            file,
+            options,
+            allow_unattested_provider,
+        } => run_headless_command(file.as_deref(), &options, allow_unattested_provider),
         Action::Setup(options) => setup_command(&options),
         Action::Update(options) => rts::update::apply::command(&options),
         Action::Version => {

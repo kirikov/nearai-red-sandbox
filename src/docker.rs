@@ -23,7 +23,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::copy::{CopyLimits, copy_in_via, copy_out_via};
-use crate::mvm::{BACKSTOP, RunOutput, Runner, is_image_ref, is_machine_name, run_captured, tail};
+use crate::mvm::{
+    BACKSTOP, RunOutput, Runner, StateDir, is_image_ref, is_machine_name, run_captured, tail,
+};
 use crate::protocol::{WrapOptions, new_nonce, parse_result, wrap_argv};
 use crate::sandbox::{
     CopyOutResult, CreateSpec, Error, Exec, ExecOptions, ExecResult, Result, Sandbox, sv,
@@ -90,6 +92,9 @@ pub struct DockerSandbox {
     run: Box<dyn Runner>,
     runtime: Option<String>,
     init: bool,
+    /// Shared with the launcher and the other tool processes of the
+    /// session: the unavailable marker and the exec lock (held shared).
+    state: Option<StateDir>,
     dead: Mutex<Option<String>>,
     copy_limits: CopyLimits,
 }
@@ -106,9 +111,18 @@ impl DockerSandbox {
             run,
             runtime: None,
             init: true,
+            state: None,
             dead: Mutex::new(None),
             copy_limits: CopyLimits::default(),
         })
+    }
+
+    /// Share the session's state directory: a marker set by any process
+    /// refuses every later exec here, and `quiesce` waits for this
+    /// sandbox's active execs.
+    pub fn with_state(mut self, dir: StateDir) -> Self {
+        self.state = Some(dir);
+        self
     }
 
     /// `--runtime` for `docker create`; `None` is the daemon's default.
@@ -139,13 +153,24 @@ impl DockerSandbox {
     }
 
     fn dead_reason(&self) -> Option<String> {
-        self.dead.lock().unwrap().clone()
+        if let Some(r) = self.dead.lock().unwrap().clone() {
+            return Some(r);
+        }
+        self.state.as_ref().and_then(|s| s.dead_reason())
     }
 
     fn mark_unavailable(&self, reason: &str) -> Error {
         let mut d = self.dead.lock().unwrap();
         if d.is_none() {
-            *d = Some(reason.to_string());
+            *d = Some(
+                self.state
+                    .as_ref()
+                    .and_then(|s| s.dead_reason())
+                    .unwrap_or_else(|| reason.into()),
+            );
+        }
+        if let Some(s) = &self.state {
+            s.mark(reason);
         }
         Error::Unavailable(d.clone().unwrap())
     }
@@ -236,6 +261,18 @@ fn is_gone(stderr: &[u8]) -> bool {
 
 impl Exec for DockerSandbox {
     fn exec(&self, argv: &[String], o: &ExecOptions) -> Result<ExecResult> {
+        if let Some(r) = self.dead_reason() {
+            return Err(Error::Unavailable(r));
+        }
+        // Execs run concurrently (Docker journals nothing), but teardown's
+        // exclusive quiesce still waits for every active one.
+        let _shared = match &self.state {
+            Some(s) => Some(
+                s.lock_shared()
+                    .map_err(|e| Error::Other(format!("exec lock: {e}")))?,
+            ),
+            None => None,
+        };
         if let Some(r) = self.dead_reason() {
             return Err(Error::Unavailable(r));
         }
