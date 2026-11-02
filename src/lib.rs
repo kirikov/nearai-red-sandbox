@@ -7,6 +7,7 @@ pub(crate) mod json;
 pub mod config;
 pub mod forwarder;
 pub mod copy;
+pub mod docker;
 pub mod files;
 pub mod glob;
 pub mod install;

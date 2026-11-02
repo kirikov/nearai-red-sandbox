@@ -1,0 +1,8 @@
+# The guest image for the container backend on x86-64 Linux hosts (a
+# confidential VM under dstack, or a plain Docker host for tests). Same
+# layout as the microVM guest in ./Dockerfile: a read-only Alpine root whose
+# /in and /out link into the per-session /tmp. Only the base digest differs:
+# ./Dockerfile pins the arm64 Alpine for the Apple-silicon microVM.
+FROM docker.io/library/alpine@sha256:dc92f017beea8e7f43263073d717f7bc011228c95d5312e440deb4d035bb4eec
+LABEL org.opencontainers.image.source="https://github.com/nearai/nearai-red-sandbox"
+RUN ln -s /tmp/rts/in /in && ln -s /tmp/rts/out /out
