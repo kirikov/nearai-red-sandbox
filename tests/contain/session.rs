@@ -73,7 +73,7 @@ fn options(h: &Harness, p: &SessionPaths, machine: &str, nonce: &str) -> Value {
 }
 
 fn configure(h: &Harness, p: &SessionPaths, machine: &str, nonce: &str) -> PathBuf {
-    write_opencode_config(&p.config_dir, &plugin_dir(), &options(h, p, machine, nonce), &provider(), false).unwrap()
+    write_opencode_config(&p.config_dir, &plugin_dir(), &options(h, p, machine, nonce), &provider(), false, None).unwrap()
 }
 
 /// Load plugins through real opencode without spending inference.

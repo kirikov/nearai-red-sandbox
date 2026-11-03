@@ -2290,6 +2290,19 @@ mod tests {
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
     }
     #[test]
+    fn the_direct_provider_is_plain_openai_compatible_with_the_placeholder_key() {
+        let id = crate::config::DIRECT_PROVIDER_ID;
+        let p = ProviderConfig { id: id.into(), base_url: "http://127.0.0.1:1/v1".into(), models: vec!["m".into()], api_key_env: None };
+        let c = opencode_config(Path::new("/p"), &json!({}), &p, true, None);
+        // No IronWire route header: the forwarder itself is the provider.
+        assert!(c["provider"][id]["models"]["m"].get("headers").is_none(), "{c}");
+        assert_eq!(c["provider"][id]["options"]["apiKey"], crate::config::PLACEHOLDER_API_KEY);
+        assert_eq!(c["provider"][id]["options"]["baseURL"], "http://127.0.0.1:1/v1");
+        assert_eq!(c["provider"][id]["name"], PRODUCT_NAME);
+        assert_eq!(c["model"], format!("{id}/m"));
+    }
+
+    #[test]
     fn a_context_limit_sets_the_opencode_model_window() {
         let none = opencode_config(Path::new("/p"), &json!({}), &provider(), false, None);
         let m0 = &none["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"];

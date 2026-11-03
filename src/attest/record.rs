@@ -116,6 +116,11 @@ impl AttestationRecord {
         })
     }
 
+    /// "ironwire" or "direct": which process holds the key and reaches NEAR AI.
+    pub fn set_inference(&self, mode: &str) -> Result<(), String> {
+        self.update(|doc| doc["inference"] = mode.into())
+    }
+
     /// "refused", "pin-failed", "model-refused", "signature-failed",
     /// "unattested-provider". Best effort: the caller is already failing.
     pub fn set_status(&self, status: &str, reason: &str) {
@@ -211,8 +216,10 @@ mod tests {
         a.gateway_keys.insert([0xcc; 32]);
         a.evidence.push(serde_json::json!({"model": "m"}));
         r.verified(&a).unwrap();
+        r.set_inference("direct").unwrap();
         let doc = read(&r);
         assert_eq!(doc["status"], "verified");
+        assert_eq!(doc["inference"], "direct");
         assert_eq!(
             doc["fingerprints"],
             serde_json::json!([hex::encode([0xaa; 32])])

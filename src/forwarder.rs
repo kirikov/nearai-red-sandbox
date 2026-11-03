@@ -1,10 +1,13 @@
-//! Loopback forwarder between embedded IronWire and NEAR AI.
+//! Loopback forwarder between the sandbox's inference client and NEAR AI.
 //!
-//! IronWire's NEAR AI endpoint is this forwarder. It forwards only
-//! `POST /v1/chat/completions` for allowlisted models, byte for byte, to
-//! NEAR AI over TLS pinned to the attested certificate fingerprints
-//! (`pin.rs`). A pin failure or a refused model raises `Fatal`, after which
-//! nothing reaches upstream and the session loop ends the session.
+//! Behind IronWire (the launch path) or as opencode's provider itself (the
+//! headless direct path, where it holds the key and swaps the sandbox's
+//! placeholder for it). It forwards only `POST /v1/chat/completions` for
+//! allowlisted models, byte for byte, to NEAR AI over TLS pinned to the
+//! attested gateway certificate fingerprints (`pin.rs`), and answers
+//! `GET /v1/models` locally from the allowlist. A pin failure or a refused
+//! model raises `Fatal`, after which nothing reaches upstream and the
+//! session loop ends the session.
 //!
 //! Each completion is hashed as it is relayed and, once it has ended, its
 //! NEAR AI receipt is fetched and checked off the response path
@@ -112,6 +115,11 @@ pub struct ForwarderConfig {
     /// per-response signatures only, so the gateway can fail over (the NEAR AI
     /// documented verification path).
     pub pin_tls: bool,
+    /// Direct mode: the forwarder holds the NEAR AI key. The sandbox sends
+    /// `config::PLACEHOLDER_API_KEY`, which this bearer replaces upstream and
+    /// in the signature fetch, so the key never enters the container. None
+    /// passes the inbound Authorization through (IronWire holds the key).
+    pub key: Option<ironwire_proxy::embed::HostSecret>,
     pub signatures: signature::SignaturePolicy,
     /// `record.session_dir().join("inference.jsonl")`.
     pub inference_log: std::path::PathBuf,
@@ -145,6 +153,8 @@ struct State {
     fatal: Arc<Fatal>,
     record: Arc<AttestationRecord>,
     max_request_bytes: usize,
+    /// Direct mode: `Bearer <key>`, sent in place of the inbound placeholder.
+    key: Option<HeaderValue>,
     /// "https://cloud-api.near.ai/v1", for `/signature/{id}`.
     upstream: String,
     /// The seed's attested signing keys per model, merged with every
@@ -216,6 +226,17 @@ impl Forwarder {
             .read_timeout(UPSTREAM_READ_TIMEOUT)
             .build()
             .map_err(|e| format!("forwarder: upstream client: {e}"))?;
+        let key = match cfg.key {
+            Some(secret) => {
+                use secrecy::ExposeSecret;
+                let mut value =
+                    HeaderValue::from_str(&format!("Bearer {}", secret.expose_secret()))
+                        .map_err(|_| "forwarder: the inference key is not a valid header value")?;
+                value.set_sensitive(true);
+                Some(value)
+            }
+            None => None,
+        };
         let state = Arc::new(State {
             completions: format!("{upstream}/chat/completions"),
             models: cfg.models.into_iter().collect(),
@@ -226,6 +247,7 @@ impl Forwarder {
             fatal: cfg.fatal,
             record: cfg.record,
             max_request_bytes: cfg.max_request_bytes,
+            key,
             upstream: upstream.to_string(),
             keys: RwLock::new(cfg.seed.keys),
             gateway_keys: RwLock::new(cfg.seed.gateway_keys),
@@ -422,6 +444,25 @@ fn local(status: StatusCode, message: &'static str) -> Out {
     resp
 }
 
+/// The allowlist as an OpenAI model list, answered locally: a listing never
+/// reaches upstream.
+fn models_reply(state: &State) -> Out {
+    let data: Vec<serde_json::Value> = state
+        .models
+        .iter()
+        .map(|m| serde_json::json!({ "id": m, "object": "model", "owned_by": "nearai" }))
+        .collect();
+    let body = serde_json::json!({ "object": "list", "data": data }).to_string();
+    let mut resp = Response::new(
+        Full::new(Bytes::from(body))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    resp.headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp
+}
+
 /// Raises fatal and, only if this is the first fatal, writes the matching
 /// terminal status, so attestation.json and the stop reason agree.
 fn stop(fatal: &Fatal, record: &AttestationRecord, status: &str, reason: &str) -> bool {
@@ -455,6 +496,9 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
     if state.fatal.reason().is_some() {
         return stopped_reply();
     }
+    if req.method() == Method::GET && req.uri().path() == "/v1/models" {
+        return models_reply(state);
+    }
     if req.method() != Method::POST || req.uri().path() != "/v1/chat/completions" {
         eprintln!("{}", not_forwarded_line(req.method(), req.uri().path()));
         return local(StatusCode::NOT_FOUND, "rts forwarder: not forwarded");
@@ -482,6 +526,28 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
     if state.fatal.reason().is_some() {
         return stopped_reply();
     }
+    if let Some(key) = &state.key {
+        // Direct mode: only the placeholder is accepted inbound, so a real
+        // key configured into the sandbox by mistake is refused, never relayed.
+        let placeholder = format!("Bearer {}", crate::config::PLACEHOLDER_API_KEY);
+        let accepted = {
+            let mut inbound = headers.get_all(AUTHORIZATION).iter();
+            matches!(
+                (inbound.next(), inbound.next()),
+                (Some(v), None) if v.as_bytes() == placeholder.as_bytes()
+            )
+        };
+        if !accepted {
+            return local(
+                StatusCode::UNAUTHORIZED,
+                "rts forwarder: the sandbox must send the placeholder key",
+            );
+        }
+        headers.insert(AUTHORIZATION, key.clone());
+    }
+    // The documented verification path: the gateway serves the named model
+    // itself, never an alias, so the attested keys are the ones that sign.
+    headers.insert("x-no-aliasing", HeaderValue::from_static("true"));
     let Some(model) = request_model(&body) else {
         return local(
             StatusCode::BAD_REQUEST,
@@ -1547,6 +1613,21 @@ mod tests {
         max: usize,
         signatures: SignaturePolicy,
     ) -> Rig {
+        rig_keyed(up, seed, keys, gateway_keys, reattest, max, signatures, None)
+    }
+
+    /// As `rig_seeded`; `key` Some is direct mode (the forwarder holds it).
+    #[allow(clippy::too_many_arguments)]
+    fn rig_keyed(
+        up: &Upstream,
+        seed: &[&str],
+        keys: &[[u8; 32]],
+        gateway_keys: &[[u8; 32]],
+        reattest: Reattest,
+        max: usize,
+        signatures: SignaturePolicy,
+        key: Option<ironwire_proxy::embed::HostSecret>,
+    ) -> Rig {
         let dir = crate::testutil::tempdir("forwarder");
         let record =
             AttestationRecord::create(&dir, "0123456789ab", &AttestOptions::default()).unwrap();
@@ -1568,6 +1649,7 @@ mod tests {
             record: record.clone(),
             max_request_bytes: max,
             pin_tls: true,
+            key,
             signatures,
             inference_log: record.session_dir().join("inference.jsonl"),
         })
@@ -1683,12 +1765,15 @@ mod tests {
                 "authorization",
                 "content-length",
                 "content-type",
-                "host"
+                "host",
+                "x-no-aliasing"
             ]),
             "{head}"
         );
         assert!(head.lines().any(|l| l == "accept: text/event-stream"));
         assert!(head.lines().any(|l| l == "accept-encoding: identity"));
+        // Added by the forwarder, not forwarded: the gateway may not alias.
+        assert!(head.lines().any(|l| l == "x-no-aliasing: true"));
     }
 
     #[test]
@@ -1861,8 +1946,14 @@ mod tests {
         let up = upstream(|_| "a", false, ok_reply);
         let calls = Arc::new(AtomicUsize::new(0));
         let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        // The model list is answered locally from the allowlist.
+        let (status, body) = send(rig.fw(), "GET", "/v1/models", b"");
+        assert_eq!(status, 200);
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["object"], "list");
+        assert_eq!(listed["data"][0]["id"], "m");
+        assert_eq!(listed["data"].as_array().map(Vec::len), Some(1));
         for (method, path) in [
-            ("GET", "/v1/models"),
             ("POST", "/v1/responses"),
             ("GET", "/v1/signature/x"),
             ("GET", "/v1/chat/completions"),
@@ -1948,6 +2039,63 @@ mod tests {
     }
 
     #[test]
+    fn direct_mode_holds_the_key_and_the_sandbox_sends_the_placeholder() {
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig_keyed(
+            &up,
+            &["a"],
+            &[test_vk()],
+            &[],
+            reattest(&["a"], &calls),
+            1 << 20,
+            quick(),
+            Some(ironwire_proxy::embed::HostSecret::from(DUMMY_KEY.to_string())),
+        );
+        // `send` bears DUMMY_KEY: a real key in the sandbox is refused, never
+        // relayed. So is a request with no key at all.
+        assert_eq!(rig.post(BODY).0, 401);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let url = format!("{}/chat/completions", rig.fw().base_url());
+        let bare = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(BODY.to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(bare.status(), 401);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(up.requests().is_empty());
+        assert_eq!(rig.fatal.reason(), None);
+
+        // The placeholder is swapped for the held key upstream.
+        let resp = client
+            .post(&url)
+            .bearer_auth(crate::config::PLACEHOLDER_API_KEY)
+            .header("content-type", "application/json")
+            .body(BODY.to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().unwrap().as_ref(), REPLY);
+        let seen = up.requests();
+        assert_eq!(seen.len(), 1);
+        let head = seen[0].head.to_ascii_lowercase();
+        assert!(
+            head.lines()
+                .any(|l| l == format!("authorization: bearer {}", DUMMY_KEY.to_ascii_lowercase())),
+            "{head}"
+        );
+        assert!(!head.contains(crate::config::PLACEHOLDER_API_KEY), "{head}");
+        assert!(head.lines().any(|l| l == "x-no-aliasing: true"), "{head}");
+        no_key_in(&rig);
+    }
+
+    #[test]
     fn start_refuses_an_empty_seed_and_a_plain_http_upstream() {
         let dir = crate::testutil::tempdir("forwarder-start");
         let record =
@@ -1966,6 +2114,7 @@ mod tests {
             record: record.clone(),
             max_request_bytes: 1024,
             pin_tls: true,
+            key: None,
             signatures: SignaturePolicy::default(),
             inference_log: record.session_dir().join("inference.jsonl"),
         };
@@ -1990,6 +2139,7 @@ mod tests {
                 record: record.clone(),
                 max_request_bytes: 1024,
                 pin_tls: false,
+                key: None,
                 signatures: SignaturePolicy::default(),
                 inference_log: record.session_dir().join("inference.jsonl"),
             }

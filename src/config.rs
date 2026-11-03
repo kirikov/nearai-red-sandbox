@@ -14,9 +14,24 @@ pub const DEFAULT_IMAGE: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sand
 pub const IRONWIRE_PROVIDER_ID: &str = "ironwire";
 /// The provider rts itself configures after attestation (src/inference.rs).
 pub const EMBEDDED_PROVIDER_ID: &str = "nearai-red-embedded";
+/// The provider rts configures on the headless direct path: opencode talks to
+/// the forwarder itself, which holds the key (rts run --inference direct).
+pub const DIRECT_PROVIDER_ID: &str = "nearai-red-direct";
+
+/// How a session's inference reached NEAR AI, by its provider: "ironwire"
+/// (IronWire holds the key, in front of the forwarder), "direct" (the
+/// forwarder holds the key), or "external" (an operator-named provider).
+pub fn inference_mode(provider_id: &str) -> &'static str {
+    match provider_id {
+        EMBEDDED_PROVIDER_ID => "ironwire",
+        DIRECT_PROVIDER_ID => "direct",
+        _ => "external",
+    }
+}
 pub const IRONWIRE_BASE_URL: &str = "http://127.0.0.1:8463/openai/v1";
-/// Sent as the API key when the provider needs none. IronWire strips the
-/// inbound authorization header and attaches its own credential.
+/// Sent as the API key when the provider needs none. IronWire, or the
+/// forwarder in direct mode, strips the inbound authorization header and
+/// attaches its own credential.
 pub const PLACEHOLDER_API_KEY: &str = "ironwire-holds-the-key";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,9 +394,9 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
     let raw: Raw = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
     let p = raw.provider;
     let embedded_inference = p.id.is_none() && p.base_url.is_none() && p.api_key_env.is_none();
-    if p.id.as_deref() == Some(EMBEDDED_PROVIDER_ID) {
+    if let Some(id @ (EMBEDDED_PROVIDER_ID | DIRECT_PROVIDER_ID)) = p.id.as_deref() {
         return Err(format!(
-            "config: provider.id {EMBEDDED_PROVIDER_ID} is reserved for rts's attested NEAR AI inference; omit provider for it, or name an external provider differently"
+            "config: provider.id {id} is reserved for rts's attested NEAR AI inference; omit provider for it, or name an external provider differently"
         ));
     }
     let id = p.id.unwrap_or_else(|| IRONWIRE_PROVIDER_ID.into());
@@ -659,13 +674,23 @@ mod tests {
 
     #[test]
     fn an_operator_config_cannot_claim_the_embedded_provider_id() {
-        for t in [
-            r#"{ "provider": { "id": "nearai-red-embedded", "baseURL": "https://x.example/v1", "apiKeyEnv": "K" } }"#,
-            r#"{ "provider": { "id": "nearai-red-embedded" } }"#,
-        ] {
-            let e = parse(t).unwrap_err();
-            assert!(e.contains("nearai-red-embedded") && e.contains("reserved"), "{e}");
+        for id in ["nearai-red-embedded", "nearai-red-direct"] {
+            for t in [
+                format!(r#"{{ "provider": {{ "id": "{id}", "baseURL": "https://x.example/v1", "apiKeyEnv": "K" }} }}"#),
+                format!(r#"{{ "provider": {{ "id": "{id}" }} }}"#),
+            ] {
+                let e = parse(&t).unwrap_err();
+                assert!(e.contains(id) && e.contains("reserved"), "{e}");
+            }
         }
+    }
+
+    #[test]
+    fn the_inference_mode_follows_the_provider_id() {
+        assert_eq!(inference_mode(EMBEDDED_PROVIDER_ID), "ironwire");
+        assert_eq!(inference_mode(DIRECT_PROVIDER_ID), "direct");
+        assert_eq!(inference_mode("ironwire"), "external");
+        assert_eq!(inference_mode("nearai"), "external");
     }
 
     #[test]

@@ -266,6 +266,7 @@ pub fn run_headless(cfg: &OperatorConfig, o: &RunOptions, deps: Deps) -> i32 {
         "runtime": o.runtime,
         "model": format!("{}/{}", cfg.provider.id, cfg.provider.models[0]),
         "attested": cfg.embedded_inference,
+        "inference": crate::config::inference_mode(&cfg.provider.id),
         "opencodeExit": live.opencode_exit,
         "exit": code,
         "reason": reason,

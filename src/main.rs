@@ -29,6 +29,18 @@ struct VmSize {
     memory_mib: Option<u32>,
 }
 
+/// Which process holds the NEAR AI key on the headless attested path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InferenceMode {
+    /// opencode → forwarder (holds the key) → NEAR AI: the documented
+    /// verification path (gateway TLS pin, model attestation, per-response
+    /// signatures), with the model's own context window.
+    Direct,
+    /// opencode → IronWire (holds the key) → forwarder → NEAR AI, as the
+    /// launch path.
+    IronWire,
+}
+
 #[derive(Debug)]
 enum Action {
     Help,
@@ -41,6 +53,7 @@ enum Action {
         options: rts::headless::RunOptions,
         allow_unattested_provider: bool,
         compose_policy: attest::ComposePolicy,
+        inference: InferenceMode,
     },
     Login(auth::LoginOptions),
     Launch {
@@ -262,6 +275,7 @@ fn parse_run(flags: &[&str]) -> Result<Action, String> {
     let mut timeout_min = None;
     let mut allow_unattested_provider = false;
     let mut compose_policy = attest::ComposePolicy::Pinned;
+    let mut inference = InferenceMode::Direct;
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
@@ -299,6 +313,13 @@ fn parse_run(flags: &[&str]) -> Result<Action, String> {
                     _ => return Err("--compose-policy must be pinned or mr-config-only".into()),
                 }
             }
+            "--inference" => {
+                inference = match *value {
+                    "direct" => InferenceMode::Direct,
+                    "ironwire" => InferenceMode::IronWire,
+                    _ => return Err("--inference must be direct or ironwire".into()),
+                }
+            }
             _ => return Err(format!("Unknown option for run: {flag}")),
         }
     }
@@ -315,6 +336,7 @@ fn parse_run(flags: &[&str]) -> Result<Action, String> {
         options,
         allow_unattested_provider,
         compose_policy,
+        inference,
     })
 }
 
@@ -328,9 +350,10 @@ fn run_headless_command(
     options: &rts::headless::RunOptions,
     allow_unattested_provider: bool,
     compose_policy: attest::ComposePolicy,
+    inference: InferenceMode,
 ) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
-    let mut cfg = if let Some(file) = file {
+    let cfg = if let Some(file) = file {
         config::load_config(file, &defaults)?
     } else {
         config::parse_config(
@@ -351,7 +374,7 @@ fn run_headless_command(
     }
     let session_id = session::new_session_id();
     if cfg.embedded_inference {
-        return run_headless_attested(cfg, options, &env, attest_options, session_id);
+        return run_headless_attested(cfg, options, &env, attest_options, session_id, inference);
     }
     record_unattested(&cfg, &session_id, &attest_options)?;
     let deps = session::Deps::real(session_id, None)?;
@@ -373,17 +396,19 @@ fn embedded_inference_key(env: &[(String, String)]) -> Result<String, String> {
 }
 
 /// The headless attested path: verify NEAR AI's attestation for every model,
-/// start the pinned forwarder and IronWire on host loopback, hand opencode
-/// only that embedded provider, and keep both alive for the whole run. The
-/// inference key is NEARAI_API_KEY from the environment; there is no
-/// interactive sign-in on a headless host. The forwarder's fatal reason ends
-/// the session if re-attestation fails mid-run.
+/// start the pinned forwarder on host loopback (and, in IronWire mode, IronWire
+/// in front of it), hand opencode only that provider, and keep it alive for
+/// the whole run. In direct mode the forwarder holds the key and opencode
+/// sends the placeholder. The inference key is NEARAI_API_KEY from the
+/// environment; there is no interactive sign-in on a headless host. The
+/// forwarder's fatal reason ends the session if re-attestation fails mid-run.
 fn run_headless_attested(
     mut cfg: config::OperatorConfig,
     options: &rts::headless::RunOptions,
     env: &[(String, String)],
     attest_options: attest::AttestOptions,
     session_id: String,
+    mode: InferenceMode,
 ) -> Result<i32, String> {
     let key = ironwire_proxy::embed::HostSecret::from(embedded_inference_key(env)?);
 
@@ -399,35 +424,62 @@ fn run_headless_attested(
             .map_err(refused)?,
     );
     let attested = attestor.attest().map_err(refused)?;
-    let (forwarder, inference) = start_connected(
-        &record,
-        attested,
-        |seed| {
-            forwarder::Forwarder::start(forwarder::ForwarderConfig {
-                upstream: inference::NEAR_BASE_URL.into(),
-                models: cfg.provider.models.clone(),
-                roots: forwarder::pin::native_roots()?,
-                seed,
-                reattest: {
-                    let attestor = attestor.clone();
-                    Arc::new(move || attestor.attest())
-                },
-                fatal: fatal.clone(),
-                record: record.clone(),
-                max_request_bytes: 32 << 20,
-                pin_tls: true,
-                signatures: forwarder::signature::SignaturePolicy::default(),
-                inference_log: record.session_dir().join("inference.jsonl"),
-            })
-        },
-        |forwarder| inference::start_with_endpoint(key, &cfg.provider.models, &forwarder.base_url()),
-    )?;
-    cfg.provider = inference.provider();
-    // IronWire drops before the forwarder it rides on: hold them in Connected.
-    let connected = Connected {
-        _inference: inference,
-        _forwarder: forwarder,
+    let forwarder_config = |seed, key| -> Result<forwarder::ForwarderConfig, String> {
+        Ok(forwarder::ForwarderConfig {
+            upstream: inference::NEAR_BASE_URL.into(),
+            models: cfg.provider.models.clone(),
+            roots: forwarder::pin::native_roots()?,
+            seed,
+            reattest: {
+                let attestor = attestor.clone();
+                Arc::new(move || attestor.attest())
+            },
+            fatal: fatal.clone(),
+            record: record.clone(),
+            max_request_bytes: 32 << 20,
+            pin_tls: true,
+            key,
+            signatures: forwarder::signature::SignaturePolicy::default(),
+            inference_log: record.session_dir().join("inference.jsonl"),
+        })
     };
+    let mode_name = match mode {
+        InferenceMode::Direct => "direct",
+        InferenceMode::IronWire => "ironwire",
+    };
+    let (provider, connected) = match mode {
+        InferenceMode::Direct => {
+            let (forwarder, ()) = start_connected(
+                &record,
+                attested,
+                |seed| forwarder::Forwarder::start(forwarder_config(seed, Some(key))?),
+                |_| Ok(()),
+            )?;
+            let provider = config::ProviderConfig {
+                id: config::DIRECT_PROVIDER_ID.into(),
+                base_url: forwarder.base_url(),
+                models: cfg.provider.models.clone(),
+                api_key_env: None,
+            };
+            (provider, Connected { _inference: None, _forwarder: forwarder })
+        }
+        InferenceMode::IronWire => {
+            let (forwarder, inference) = start_connected(
+                &record,
+                attested,
+                |seed| forwarder::Forwarder::start(forwarder_config(seed, None)?),
+                |forwarder| {
+                    inference::start_with_endpoint(key, &cfg.provider.models, &forwarder.base_url())
+                },
+            )?;
+            // IronWire drops before the forwarder it rides on: hold them in Connected.
+            (inference.provider(), Connected { _inference: Some(inference), _forwarder: forwarder })
+        }
+    };
+    record
+        .set_inference(mode_name)
+        .map_err(|e| format!("cannot record the inference mode in {}: {e}", record.path().display()))?;
+    cfg.provider = provider;
     let deps = session::Deps::real(session_id, Some(fatal))?;
     let code = rts::headless::run_headless(&cfg, options, deps);
     drop(connected);
@@ -451,7 +503,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts run --image REF --prompt-file FILE [--config PATH] [--inputs DIR] [--docker PATH]\n               [--runtime NAME] [--timeout-min N] [--compose-policy pinned|mr-config-only] [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\nrts run is the headless session for a Linux host (a confidential VM): the sandbox is a container\n(REF is name@sha256:… or sha256:…, no network), opencode runs the prompt file once and exits, and\n/out lands in sessions/<id>/out. It needs an explicit provider in the session file.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts run --image REF --prompt-file FILE [--config PATH] [--inputs DIR] [--docker PATH]\n               [--runtime NAME] [--timeout-min N] [--compose-policy pinned|mr-config-only] [--allow-unattested-provider]\n               [--inference direct|ironwire]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\nrts run is the headless session for a Linux host (a confidential VM): the sandbox is a container\n(REF is name@sha256:… or sha256:…, no network), opencode runs the prompt file once and exits, and\n/out lands in sessions/<id>/out. With no provider in the session file it attests NEAR AI and keys\ninference from NEARAI_API_KEY: --inference direct (the default) makes the forwarder opencode's\nprovider, holding the key and verifying every response signature behind the gateway TLS pin, so\nthe model's own context window applies; --inference ironwire puts IronWire in front of it.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -556,7 +608,8 @@ fn record_unattested(
 /// IronWire, then the forwarder: fields drop in declaration order, so
 /// IronWire shuts down before its only route to NEAR AI.
 struct Connected {
-    _inference: inference::EmbeddedInference,
+    /// None on the headless direct path, where opencode talks to the forwarder.
+    _inference: Option<inference::EmbeddedInference>,
     _forwarder: forwarder::Forwarder,
 }
 
@@ -687,6 +740,7 @@ fn launch(
                         record: record.clone(),
                         max_request_bytes: 32 << 20,
                         pin_tls: true,
+                        key: None,
                         signatures: forwarder::signature::SignaturePolicy::default(),
                         inference_log: record.session_dir().join("inference.jsonl"),
                     })
@@ -703,7 +757,7 @@ fn launch(
             Ok((
                 inference.provider(),
                 Connected {
-                    _inference: inference,
+                    _inference: Some(inference),
                     _forwarder: forwarder,
                 },
             ))
@@ -799,7 +853,8 @@ fn main() -> ExitCode {
             options,
             allow_unattested_provider,
             compose_policy,
-        } => run_headless_command(file.as_deref(), &options, allow_unattested_provider, compose_policy),
+            inference,
+        } => run_headless_command(file.as_deref(), &options, allow_unattested_provider, compose_policy, inference),
         Action::Setup(options) => setup_command(&options),
         Action::Update(options) => rts::update::apply::command(&options),
         Action::Version => {
