@@ -439,7 +439,13 @@ fn run_headless_attested(
             max_request_bytes: 32 << 20,
             pin_tls: true,
             key,
-            signatures: forwarder::signature::SignaturePolicy::default(),
+            // A headless run outlives the gateway's streaming timeout on big
+            // prompts (run 8: cut after 600 s); a cut stream is logged
+            // unverified and opencode retries, instead of ending the review.
+            signatures: forwarder::signature::SignaturePolicy {
+                stream_failure: forwarder::signature::StreamFailure::Unverified,
+                ..Default::default()
+            },
             inference_log: record.session_dir().join("inference.jsonl"),
         })
     };

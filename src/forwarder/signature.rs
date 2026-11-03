@@ -211,6 +211,7 @@ pub struct SignaturePolicy {
     pub window: Duration,
     pub first_backoff: Duration,
     pub max_backoff: Duration,
+    pub stream_failure: StreamFailure,
 }
 
 impl Default for SignaturePolicy {
@@ -219,8 +220,22 @@ impl Default for SignaturePolicy {
             window: Duration::from_secs(10),
             first_backoff: Duration::from_millis(250),
             max_backoff: Duration::from_secs(2),
+            stream_failure: StreamFailure::Fatal,
         }
     }
+}
+
+/// What a response stream that upstream cut mid-way means. The partial body
+/// has no receipt, so it is never "verified"; the question is whether the
+/// session survives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFailure {
+    /// `signature-failed` ends the session (the launch path).
+    Fatal,
+    /// One `unverified` line; the client sees the broken stream and retries.
+    /// For a long headless run, where the connection is pinned to the attested
+    /// gateway and a cut stream is that gateway timing out, not a forgery.
+    Unverified,
 }
 
 /// Why a receipt fetch ended without a receipt.
@@ -633,6 +648,7 @@ mod tests {
             window: Duration::from_millis(window_ms),
             first_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(50),
+            ..Default::default()
         }
     }
 

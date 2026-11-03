@@ -717,6 +717,9 @@ enum Relayed {
     Complete,
     /// Fatal was raised elsewhere while it was relaying.
     Stopped,
+    /// Upstream cut the stream: whatever was relayed has no receipt. Fatal or
+    /// an `unverified` line, per `SignaturePolicy::stream_failure`.
+    Interrupted,
     Failed(String),
 }
 
@@ -791,7 +794,7 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
                 let chunk = match next {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break Relayed::Complete,
-                    Err(_) => break Relayed::Failed("upstream stream failed".into()),
+                    Err(_) => break Relayed::Interrupted,
                 };
                 if keep {
                     if kept.len() + chunk.len() > signature::MAX_ID_SCAN_BYTES {
@@ -862,6 +865,12 @@ async fn check(
     let outcome = match relayed {
         Relayed::Stopped => Checked::Stopped,
         _ if !status.is_success() => Checked::NotSigned,
+        Relayed::Interrupted => match state.signatures.stream_failure {
+            signature::StreamFailure::Fatal => Checked::Failed("upstream stream failed".into()),
+            signature::StreamFailure::Unverified => {
+                Checked::Unverified("upstream stream failed; partial response has no receipt".into())
+            }
+        },
         Relayed::Failed(reason) => Checked::Failed(reason),
         Relayed::Complete if ex.chat_id.is_empty() => {
             Checked::Failed("no usable chat ID in the response".into())
@@ -889,6 +898,7 @@ async fn check(
             None,
         ),
         Checked::Stopped => ("failed: session stopped".to_string(), None, None, None),
+        Checked::Unverified(reason) => (format!("unverified: {reason}"), None, None, None),
         Checked::Failed(reason) | Checked::PinFailed(reason) => {
             (format!("failed: {reason}"), None, None, None)
         }
@@ -928,6 +938,8 @@ enum Checked {
     Verified([u8; 32], Signer, Duration),
     NotSigned,
     Stopped,
+    /// A cut stream under `StreamFailure::Unverified`: logged, not fatal.
+    Unverified(String),
     Failed(String),
     /// Upstream's certificate was refused during the receipt fetch.
     PinFailed(String),
@@ -1190,6 +1202,7 @@ mod tests {
             window: Duration::from_secs(2),
             first_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(100),
+            ..Default::default()
         }
     }
 
@@ -1205,12 +1218,16 @@ mod tests {
             pauses: Vec<Duration>,
             last_sent: Arc<Mutex<Option<Instant>>>,
         },
+        /// `text/event-stream`, chunked: these chunks, then the connection is
+        /// closed without the terminating chunk (upstream cut the stream).
+        Cut(Vec<Vec<u8>>),
     }
 
     impl Answer {
         fn bytes(&self) -> Vec<u8> {
             match self {
                 Answer::Whole(_, b) | Answer::Encoded(_, b) => b.clone(),
+                Answer::Cut(chunks) => chunks.concat(),
                 Answer::Sse { chunks, .. } => chunks.concat(),
             }
         }
@@ -1479,6 +1496,20 @@ mod tests {
                         let _ = tls.flush();
                     }
                     let _ = tls.write_all(b"0\r\n\r\n");
+                }
+                Answer::Cut(chunks) => {
+                    let _ = write!(
+                        tls,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n{close}\r\n"
+                    );
+                    for chunk in &chunks {
+                        let _ = write!(tls, "{:x}\r\n", chunk.len());
+                        let _ = tls.write_all(chunk);
+                        let _ = tls.write_all(b"\r\n");
+                    }
+                    let _ = tls.flush();
+                    // No terminator, no close_notify: the socket just goes away.
+                    return;
                 }
             }
             let _ = tls.flush();
@@ -2386,6 +2417,65 @@ mod tests {
                 .head
                 .starts_with("GET /v1/signature/chatcmpl-s1?model=m&signing_algo=ed25519 ")
         );
+        assert_eq!(rig.fatal.reason(), None);
+        no_key_in(&rig);
+    }
+
+    fn cut_reply(_: &Seen) -> Answer {
+        Answer::Cut(vec![SSE[0].to_vec(), SSE[1].to_vec()])
+    }
+
+    #[test]
+    fn a_cut_stream_is_fatal_by_default() {
+        let up = upstream(|_| "a", false, cut_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let mut resp = post_stream(&rig);
+        let mut buf = Vec::new();
+        let _ = resp.read_to_end(&mut buf);
+        let lines = rig.wait_lines(1);
+        assert_eq!(lines[0]["result"], "failed: upstream stream failed", "{}", lines[0]);
+        wait_for("fatal", || rig.fatal.reason().is_some());
+        assert!(rig.fatal.reason().unwrap().starts_with("signature-failed"));
+        assert_eq!(rig.doc()["status"], "signature-failed");
+        no_key_in(&rig);
+    }
+
+    #[test]
+    fn a_cut_stream_is_unverified_not_fatal_under_the_headless_policy() {
+        let cut = Arc::new(AtomicUsize::new(0));
+        let n = cut.clone();
+        // The first streamed request is cut; everything after it completes.
+        let up = upstream(|_| "a", false, move |seen: &Seen| {
+            if seen.body.windows(13).any(|w| w == b"\"stream\":true") && n.fetch_add(1, Ordering::SeqCst) == 0 {
+                cut_reply(seen)
+            } else {
+                ok_reply(seen)
+            }
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let policy = SignaturePolicy {
+            stream_failure: signature::StreamFailure::Unverified,
+            ..quick()
+        };
+        let rig = rig_with(&up, &["a"], &[test_vk()], reattest(&["a"], &calls), 1 << 20, policy);
+        let mut resp = post_stream(&rig);
+        let mut buf = Vec::new();
+        let _ = resp.read_to_end(&mut buf);
+        let lines = rig.wait_lines(1);
+        assert!(
+            lines[0]["result"].as_str().unwrap().starts_with("unverified: upstream stream failed"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(rig.fatal.reason(), None);
+        assert_eq!(rig.doc()["status"], "verified");
+        // The session goes on: the next completion is relayed and verified.
+        let (status, body) = rig.post(BODY);
+        assert_eq!(status, 200);
+        assert_eq!(body, REPLY);
+        let lines = rig.wait_lines(2);
+        assert_eq!(lines[1]["result"], "verified", "{}", lines[1]);
         assert_eq!(rig.fatal.reason(), None);
         no_key_in(&rig);
     }
