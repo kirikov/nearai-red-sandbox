@@ -54,6 +54,9 @@ pub struct Limits {
     pub handshake_ms: u64,
     /// Wall-clock limit from boot, in hours; also the attach `--ttl`.
     pub session_hours: u32,
+    /// opencode's context window for the model, in tokens; drives auto-compaction.
+    /// None leaves it to opencode's provider default.
+    pub context_tokens: Option<u64>,
     /// The session file set `hostRssCeilingMiB`; otherwise it follows memory.
     rss_ceiling_set: bool,
 }
@@ -78,6 +81,7 @@ impl Default for Limits {
             host_rss_ceiling_mib: 2048 + RSS_HEADROOM_MIB,
             handshake_ms: 30_000,
             session_hours: 24,
+            context_tokens: None,
             rss_ceiling_set: false,
         }
     }
@@ -183,6 +187,8 @@ struct RawLimits {
     #[serde(rename = "hostRssCeilingMiB")]
     host_rss_ceiling_mib: Option<u64>,
     handshake_ms: Option<u64>,
+    #[serde(rename = "contextTokens")]
+    context_tokens: Option<u64>,
     /// Read as any JSON value so a string or fraction gets this module's
     /// refusal, not serde's.
     session_hours: Option<serde_json::Value>,
@@ -448,6 +454,10 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         host_rss_ceiling_mib,
         handshake_ms: positive(l.handshake_ms, dl.handshake_ms, "handshakeMs")?,
         session_hours: session_hours(l.session_hours.as_ref(), dl.session_hours)?,
+        context_tokens: match l.context_tokens {
+            Some(n) if n == 0 => return Err("config: limits.contextTokens must be a positive integer".into()),
+            other => other,
+        },
         rss_ceiling_set: l.host_rss_ceiling_mib.is_some(),
     };
     let network = raw.network.allow.unwrap_or_default();

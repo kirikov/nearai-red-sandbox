@@ -563,7 +563,7 @@ mod tests {
             "machine": paths.machine, "nonce": nonce, "readyFile": paths.ready_file,
             "auditFile": paths.audit_file, "provider": "ironwire", "models": provider.models, "rts": "/nonexistent-rts-no-tools-called",
             "bridge": { "machine": paths.machine }, "debugFile": paths.runtime.join("debug.json"),
-        }), &provider, false).unwrap();
+        }), &provider, false, None).unwrap();
         let launch = opencode_launch(
             &paths,
             &binary,

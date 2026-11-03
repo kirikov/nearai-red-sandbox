@@ -75,9 +75,9 @@ impl Host for RealHost {
 
 /// `embedded` is `OperatorConfig::embedded_inference`: only rts's own,
 /// attested NEAR AI inference is shown as NEAR AI Red.
-pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Value {
+pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool, context_tokens: Option<u64>) -> Value {
     let models: serde_json::Map<String, Value> = p.models.iter().map(|m| {
-        let model = if p.id == EMBEDDED_PROVIDER_ID {
+        let mut model = if p.id == EMBEDDED_PROVIDER_ID {
             // Invalid route values must fail closed rather than silently use a
             // different backend or model. Embedded startup validates these IDs.
             let route = crate::inference::route_header(m).unwrap_or_else(|_| "invalid".into());
@@ -85,6 +85,11 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         } else {
             json!({ "name": model_display_name(m), "tool_call": true })
         };
+        // A conservative context window makes opencode compact the session before
+        // the backend (IronWire to a TEE model) rejects an oversized request.
+        if let Some(n) = context_tokens {
+            model["limit"] = json!({ "context": n });
+        }
         (m.clone(), model)
     }).collect();
     let api_key = match &p.api_key_env {
@@ -113,7 +118,7 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
     })
 }
 
-pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Result<PathBuf, String> {
+pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool, context_tokens: Option<u64>) -> Result<PathBuf, String> {
     // v2.2.2 skips a plugin configured as a file path with only a warning.
     if !plugin_dir.is_dir() {
         return Err(format!("plugin path must be a directory: {}", plugin_dir.display()));
@@ -138,7 +143,7 @@ pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Val
     let instructions = dir.join("sandbox-context.md");
     write_private(&instructions, context.as_bytes()).map_err(|e| format!("writing {}: {e}", instructions.display()))?;
     let instructions = fs::canonicalize(&instructions).map_err(|e| format!("resolving {}: {e}", instructions.display()))?;
-    let mut config = opencode_config(plugin_dir, plugin_options, p, embedded);
+    let mut config = opencode_config(plugin_dir, plugin_options, p, embedded, context_tokens);
     // An absolute path is required: OpenCode's empty cwd is separate from
     // this private config directory. These instructions augment its prompt.
     config["instructions"] = json!([instructions]);
@@ -936,7 +941,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
 
     let nonce = new_nonce();
     let plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
-    write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider, cfg.embedded_inference)?;
+    write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider, cfg.embedded_inference, cfg.limits.context_tokens)?;
     // run_connected reaches the session for embedded inference only after
     // attestation verified; an external provider is recorded unattested.
     write_tui_config(&p.config_dir, &cfg.plugin_dir, &model_display_name(&cfg.provider.models[0]), cfg.embedded_inference)?;
@@ -1213,7 +1218,7 @@ mod tests {
 
     #[test]
     fn the_generated_config_loads_the_plugin_directory_with_its_options() {
-        let c = opencode_config(Path::new("/repo/plugin"), &json!({ "nonce": "n" }), &provider(), false);
+        let c = opencode_config(Path::new("/repo/plugin"), &json!({ "nonce": "n" }), &provider(), false, None);
         assert_eq!(c["plugin"], json!([["/repo/plugin", { "nonce": "n" }]]));
         assert_eq!(c["model"], "ironwire/z-ai/glm-5.3-flash");
         assert_eq!(c["enabled_providers"], json!(["ironwire"]));
@@ -1229,7 +1234,7 @@ mod tests {
         fs::create_dir_all(&plugin).unwrap();
         for network in [false, true] {
             let dir = d.join(if network { "online" } else { "offline" });
-            let file = write_opencode_config(&dir, &plugin, &json!({ "bridge": { "proxy": network } }), &provider(), false).unwrap();
+            let file = write_opencode_config(&dir, &plugin, &json!({ "bridge": { "proxy": network } }), &provider(), false, None).unwrap();
             let config: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
             let instructions = config["instructions"].as_array().expect("sandbox instructions must be loaded");
             assert_eq!(instructions.len(), 1);
@@ -1246,10 +1251,10 @@ mod tests {
 
     #[test]
     fn the_api_key_is_a_placeholder_for_ironwire_and_an_env_reference_otherwise() {
-        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
+        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false, None);
         assert_eq!(c["provider"]["ironwire"]["options"]["apiKey"], PLACEHOLDER_API_KEY);
         let direct = ProviderConfig { id: "nearai".into(), base_url: "https://cloud-api.near.ai/v1".into(), api_key_env: Some("NEARAI_API_KEY".into()), ..provider() };
-        let c = opencode_config(Path::new("/p"), &json!({}), &direct, false);
+        let c = opencode_config(Path::new("/p"), &json!({}), &direct, false, None);
         assert_eq!(c["provider"]["nearai"]["options"]["apiKey"], "{env:NEARAI_API_KEY}");
     }
 
@@ -1260,7 +1265,7 @@ mod tests {
             models: vec!["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated".into(), "z-ai/glm-5.3-flash".into()],
             ..provider()
         };
-        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, true);
+        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, true, None);
         let p = &c["provider"]["nearai-red-embedded"];
         assert_eq!(p["name"], "NEAR AI Red");
         let deepseek = &p["models"]["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"];
@@ -1271,10 +1276,10 @@ mod tests {
         assert_eq!(c["enabled_providers"], json!(["nearai-red-embedded"]));
         // The name follows embedded inference, not the ID: a config that
         // somehow carried the embedded ID to an external endpoint is not NEAR AI Red.
-        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, false);
+        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, false, None);
         assert_eq!(c["provider"]["nearai-red-embedded"]["name"], "nearai-red-embedded");
         // An external provider is not NEAR AI Red; it keeps its own ID as its name.
-        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
+        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false, None);
         assert_eq!(c["provider"]["ironwire"]["name"], "ironwire");
         assert_eq!(c["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
     }
@@ -1285,7 +1290,7 @@ mod tests {
         // version the launcher refuses. Measured in the stage 2 spike
         // (2026-10-30): "autoupdate": false removes the notice and the check.
         for embedded in [true, false] {
-            let c = opencode_config(Path::new("/p"), &json!({}), &provider(), embedded);
+            let c = opencode_config(Path::new("/p"), &json!({}), &provider(), embedded, None);
             assert_eq!(c["autoupdate"], json!(false));
         }
     }
@@ -1329,7 +1334,7 @@ mod tests {
     fn the_plugin_path_must_be_a_directory() {
         let d = tempdir("sess");
         fs::write(d.join("index.ts"), "").unwrap();
-        let e = write_opencode_config(&d.join("cfg"), &d.join("index.ts"), &json!({}), &provider(), false).unwrap_err();
+        let e = write_opencode_config(&d.join("cfg"), &d.join("index.ts"), &json!({}), &provider(), false, None).unwrap_err();
         assert!(e.contains("must be a directory"));
         fs::remove_dir_all(d).unwrap();
     }
@@ -2284,4 +2289,13 @@ mod tests {
         assert!(log.contains("teardown: opencode stopped"), "{log}");
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
     }
+    #[test]
+    fn a_context_limit_sets_the_opencode_model_window() {
+        let none = opencode_config(Path::new("/p"), &json!({}), &provider(), false, None);
+        let m0 = &none["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"];
+        assert!(m0.get("limit").is_none(), "no limit without context_tokens: {m0}");
+        let set = opencode_config(Path::new("/p"), &json!({}), &provider(), false, Some(96_000));
+        assert_eq!(set["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["limit"]["context"], 96_000);
+    }
+
 }

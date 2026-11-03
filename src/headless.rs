@@ -394,6 +394,7 @@ fn body(
         &options,
         &cfg.provider,
         cfg.embedded_inference,
+        cfg.limits.context_tokens,
     )?;
     if fs::read_dir(&p.work)
         .map_err(|e| e.to_string())?
