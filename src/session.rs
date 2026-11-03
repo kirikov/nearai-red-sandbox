@@ -24,6 +24,9 @@ use crate::brand::progress::Live as Shown;
 
 pub const OPENCODE_VERSION: &str = "2.2.2";
 pub const PRODUCT_NAME: &str = "NEAR AI Red";
+/// opencode's per-reply output cap when a context window is configured
+/// (every NEAR AI TEE model allows at least this much output).
+pub const OUTPUT_TOKENS: u64 = 32_768;
 pub const TERMINAL_TITLE: &str = "NEAR AI Red SandBox";
 /// The terminal UI plugin directory inside the plugin shim.
 pub const BRANDING_PLUGIN: &str = "branding";
@@ -86,9 +89,11 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
             json!({ "name": model_display_name(m), "tool_call": true })
         };
         // A conservative context window makes opencode compact the session before
-        // the backend (IronWire to a TEE model) rejects an oversized request.
+        // the backend rejects an oversized request. opencode's Model.Info schema
+        // requires `output` next to `context`: a limit with only `context` fails
+        // validation and the model is silently dropped ("Model unavailable").
         if let Some(n) = context_tokens {
-            model["limit"] = json!({ "context": n });
+            model["limit"] = json!({ "context": n, "output": OUTPUT_TOKENS });
         }
         (m.clone(), model)
     }).collect();
@@ -2308,7 +2313,10 @@ mod tests {
         let m0 = &none["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"];
         assert!(m0.get("limit").is_none(), "no limit without context_tokens: {m0}");
         let set = opencode_config(Path::new("/p"), &json!({}), &provider(), false, Some(96_000));
-        assert_eq!(set["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["limit"]["context"], 96_000);
+        let limit = &set["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["limit"];
+        assert_eq!(limit["context"], 96_000);
+        // Required by opencode's Model.Info schema; without it the model vanishes.
+        assert_eq!(limit["output"], OUTPUT_TOKENS);
     }
 
 }
