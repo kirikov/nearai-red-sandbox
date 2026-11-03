@@ -38,12 +38,10 @@ product is unchanged.
 | Tests | Unit tests with a fake runner mirror `mvm.rs`. `tests/container.rs` runs the containment checks against a real daemon, ignored by default, prerequisites fail loudly. |
 | State dir | The container sandbox shares the session's state directory like mvm: any process's unavailable marker refuses later execs, and execs hold the exec lock shared (no serialization among themselves) so teardown's exclusive `quiesce` still waits for them. |
 | copyIn | The guest tar extracts with `-o`: a container without `CAP_CHOWN` cannot restore the archive's owner, and both busybox and GNU tar accept the flag. |
-| Headless session | `rts run --image REF --prompt-file FILE [--inputs DIR] [--docker PATH] [--runtime NAME] [--timeout-min N] --allow-unattested-provider`: the session file supplies provider, limits, opencode and the plugin; the sandbox is a container with no network; `opencode run --standalone --format json --auto` runs the prompt once; its JSON events land in `sessions/<id>/opencode.jsonl`; `/out` is exported at teardown and `session.json` records the outcome. An explicit provider is required: the attested embedded provider (IronWire and the pinned forwarder) is not wired for headless yet, so the run is recorded unattested like `rts launch --allow-unattested-provider`. |
+| Headless session | `rts run --image REF --prompt-file FILE [--inputs DIR] [--docker PATH] [--runtime NAME] [--timeout-min N] --allow-unattested-provider`: the session file supplies provider, limits, opencode and the plugin; the sandbox is a container with no network; `opencode run --standalone --format json --auto` runs the prompt once; its JSON events land in `sessions/<id>/opencode.jsonl`; `/out` is exported at teardown and `session.json` records the outcome. Inference: an embedded config (no explicit provider) gets rts's attested NEAR AI stack, the same as `rts launch` — attestation verified per model, the pinned forwarder and IronWire on host loopback, the key from NEARAI_API_KEY (no interactive sign-in on a headless host), and the forwarder's fatal reason ends the run. An explicit external provider still runs unattested behind `--allow-unattested-provider`. |
 
 ## Not in this increment
 
-- Attested inference for the headless session (the forwarder and IronWire
-  start on the `launch` path only).
 - An RSS ceiling for containers in the session loop; the orphan sweep only
   logs `rts-*` containers it finds, as the mvm sweep does.
 - Building the guest image for Linux in CI and publishing its digest.
