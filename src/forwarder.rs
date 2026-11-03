@@ -107,6 +107,11 @@ pub struct ForwarderConfig {
     pub record: Arc<AttestationRecord>,
     /// 32 MiB in production.
     pub max_request_bytes: usize,
+    /// Pin the upstream TLS certificate to the attested fingerprints (the
+    /// launch path). `false` uses ordinary TLS to the host and attests by the
+    /// per-response signatures only, so the gateway can fail over (the NEAR AI
+    /// documented verification path).
+    pub pin_tls: bool,
     pub signatures: signature::SignaturePolicy,
     /// `record.session_dir().join("inference.jsonl")`.
     pub inference_log: std::path::PathBuf,
@@ -173,8 +178,13 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 impl Forwarder {
     pub fn start(cfg: ForwarderConfig) -> Result<Forwarder, String> {
-        if cfg.seed.fingerprints.is_empty() {
+        if cfg.pin_tls && cfg.seed.fingerprints.is_empty() {
             return Err("forwarder: no attested certificate fingerprints to pin".into());
+        }
+        if !cfg.pin_tls && cfg.seed.keys.is_empty() {
+            // Signature mode has no TLS pin; the per-response signatures are the
+            // only attestation binding, so the attested model keys are required.
+            return Err("forwarder: signature mode needs attested model signing keys".into());
         }
         if cfg.models.is_empty() {
             return Err("forwarder: no allowed models".into());
@@ -185,8 +195,16 @@ impl Forwarder {
         }
         let drain = cfg.signatures.window;
         let pins = PinSet::new(cfg.seed.fingerprints.clone());
+        // Pinned mode binds the connection to the attested instance's cert;
+        // signature mode uses ordinary TLS to the host and relies on the
+        // per-response signatures (which survive gateway failover).
+        let tls = if cfg.pin_tls {
+            pin::pinned_tls(cfg.roots, pins.clone())?
+        } else {
+            pin::native_tls(cfg.roots)?
+        };
         let client = reqwest::Client::builder()
-            .use_preconfigured_tls(pin::pinned_tls(cfg.roots, pins.clone())?)
+            .use_preconfigured_tls(tls)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .http1_only()
@@ -1549,6 +1567,7 @@ mod tests {
             fatal: fatal.clone(),
             record: record.clone(),
             max_request_bytes: max,
+            pin_tls: true,
             signatures,
             inference_log: record.session_dir().join("inference.jsonl"),
         })
@@ -1946,12 +1965,37 @@ mod tests {
             fatal: Fatal::new(),
             record: record.clone(),
             max_request_bytes: 1024,
+            pin_tls: true,
             signatures: SignaturePolicy::default(),
             inference_log: record.session_dir().join("inference.jsonl"),
         };
         assert!(Forwarder::start(cfg("https://127.0.0.1:1/v1", &[])).is_err());
         assert!(Forwarder::start(cfg("http://127.0.0.1:1/v1", &["a"])).is_err());
         assert!(Forwarder::start(cfg("https://127.0.0.1:1/v1", &["a"])).is_ok());
+
+        // Signature mode (no TLS pin): fingerprints are not required, but the
+        // attested model signing keys are, since they are the only binding.
+        let sig = |keyed: bool| {
+            let mut seed = Attested::default();
+            if keyed {
+                seed.keys.insert("m".into(), std::collections::BTreeSet::from([[7u8; 32]]));
+            }
+            ForwarderConfig {
+                upstream: "https://127.0.0.1:1/v1".into(),
+                models: vec!["m".into()],
+                roots: roots(),
+                seed,
+                reattest: reattest(&["a"], &calls),
+                fatal: Fatal::new(),
+                record: record.clone(),
+                max_request_bytes: 1024,
+                pin_tls: false,
+                signatures: SignaturePolicy::default(),
+                inference_log: record.session_dir().join("inference.jsonl"),
+            }
+        };
+        assert!(Forwarder::start(sig(false)).is_err(), "no keys in signature mode");
+        assert!(Forwarder::start(sig(true)).is_ok(), "no pin needed in signature mode");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

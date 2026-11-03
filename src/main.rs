@@ -415,6 +415,7 @@ fn run_headless_attested(
                 fatal: fatal.clone(),
                 record: record.clone(),
                 max_request_bytes: 32 << 20,
+                pin_tls: true,
                 signatures: forwarder::signature::SignaturePolicy::default(),
                 inference_log: record.session_dir().join("inference.jsonl"),
             })
@@ -685,6 +686,7 @@ fn launch(
                         fatal: fatal.clone(),
                         record: record.clone(),
                         max_request_bytes: 32 << 20,
+                        pin_tls: true,
                         signatures: forwarder::signature::SignaturePolicy::default(),
                         inference_log: record.session_dir().join("inference.jsonl"),
                     })

@@ -205,6 +205,23 @@ pub fn native_roots() -> Result<Arc<rustls::RootCertStore>, String> {
 }
 
 /// ring provider, PinnedVerifier, `resumption = Resumption::disabled()`, no ALPN (HTTP/1.1).
+/// Ordinary TLS to the real upstream host: the system trust roots verify the
+/// certificate chains to a public CA for the host name, with no pinning. The
+/// attestation binding then comes from the per-response signatures, not the
+/// connection, so the gateway may fail over across instances (it shares one
+/// signing key per model). Used by the signature-attested forwarder mode.
+pub fn native_tls(roots: Arc<rustls::RootCertStore>) -> Result<rustls::ClientConfig, String> {
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("forwarder: TLS versions: {e}"))?
+        .with_root_certificates((*roots).clone())
+        .with_no_client_auth();
+    cfg.resumption = Resumption::disabled();
+    cfg.alpn_protocols = Vec::new();
+    cfg.enable_early_data = false;
+    Ok(cfg)
+}
+
 pub fn pinned_tls(
     roots: Arc<rustls::RootCertStore>,
     pins: Arc<PinSet>,
