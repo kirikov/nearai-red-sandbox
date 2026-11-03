@@ -9,6 +9,11 @@
       "sha256": "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
       "recorded": "2026-10-29",
       "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11"
+    },
+    {
+      "sha256": "5e513dbd72e1c0f291f748ad06d4dbc1df55659869e649376213ac7b3c9d2e29",
+      "recorded": "2026-11-03",
+      "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for Qwen/Qwen3.8-27B-abliterated, info.app_name dstack-nvidia-0.5.11 (verified under mr-config-only, Intel TDX + NVIDIA GPU quotes checked)"
     }
   ]
 }

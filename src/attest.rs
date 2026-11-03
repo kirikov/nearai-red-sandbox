@@ -865,13 +865,14 @@ mod tests {
         for h in [
             "f571e5dafe8f96baf116a271b4be9cba228b447dd6ebe502bbda81ede7bcc7ce",
             "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
+            "5e513dbd72e1c0f291f748ad06d4dbc1df55659869e649376213ac7b3c9d2e29",
         ] {
             assert!(
                 policy.compose_hashes.contains(&report::hex32(h).unwrap()),
                 "{h} is not pinned"
             );
         }
-        assert_eq!(policy.compose_hashes.len(), 2);
+        assert_eq!(policy.compose_hashes.len(), 3);
     }
 
     /// The production evidence recorded by tests/live_attest.rs on
