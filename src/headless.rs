@@ -143,6 +143,9 @@ struct Live<'a> {
     log: &'a Logger,
     sb: &'a DockerSandbox,
     paths: &'a SessionPaths,
+    /// `docker create` was attempted; a container may exist.
+    attempted: bool,
+    /// `docker create` and `start` succeeded; /out is worth exporting.
     created: bool,
     child: Option<Child>,
     opencode_exit: Option<i32>,
@@ -161,34 +164,37 @@ impl Live<'_> {
             let _ = c.wait();
             self.log.log("teardown: opencode stopped");
         }
-        if !self.created {
+        if !self.attempted {
             return None;
         }
-        let state = StateDir(self.paths.state_dir.clone());
-        let quiesced = state.quiesce(Duration::from_secs(30));
-        if let Err(e) = &quiesced {
-            self.log.log(&format!(
-                "teardown: EXPORT SKIPPED: cannot quiesce tools: {e}"
-            ));
-        }
         let mut exported = None;
-        if quiesced.is_ok() {
-            match self.sb.copy_out("/out", &self.paths.out_dir) {
-                Ok(r) => {
-                    match &r {
-                        CopyOutResult::Exported { files, bytes } => self.log.log(&format!(
-                            "teardown: exported {files} files, {bytes} bytes to {}",
-                            self.paths.out_dir.display()
-                        )),
-                        CopyOutResult::NothingToExport => {
-                            self.log.log("teardown: nothing to export")
+        if self.created {
+            let state = StateDir(self.paths.state_dir.clone());
+            let quiesced = state.quiesce(Duration::from_secs(30));
+            if let Err(e) = &quiesced {
+                self.log.log(&format!(
+                    "teardown: EXPORT SKIPPED: cannot quiesce tools: {e}"
+                ));
+            }
+            if quiesced.is_ok() {
+                match self.sb.copy_out("/out", &self.paths.out_dir) {
+                    Ok(r) => {
+                        match &r {
+                            CopyOutResult::Exported { files, bytes } => self.log.log(&format!(
+                                "teardown: exported {files} files, {bytes} bytes to {}",
+                                self.paths.out_dir.display()
+                            )),
+                            CopyOutResult::NothingToExport => {
+                                self.log.log("teardown: nothing to export")
+                            }
                         }
+                        exported = Some(r);
                     }
-                    exported = Some(r);
+                    Err(e) => self.log.log(&format!("teardown: EXPORT FAILED: {e}")),
                 }
-                Err(e) => self.log.log(&format!("teardown: EXPORT FAILED: {e}")),
             }
         }
+        // A failed create may still have left a container: remove either way.
         match self.sb.remove() {
             Ok(()) => self
                 .log
@@ -239,6 +245,7 @@ pub fn run_headless(cfg: &OperatorConfig, o: &RunOptions, deps: Deps) -> i32 {
         log: &log,
         sb: &sb,
         paths: &p,
+        attempted: false,
         created: false,
         child: None,
         opencode_exit: None,
@@ -346,7 +353,7 @@ fn body(
         (Instant::now() >= deadline).then(|| format!("run-limit: {} minutes passed", o.timeout_min))
     };
 
-    live.created = true;
+    live.attempted = true;
     live.sb
         .create(&CreateSpec {
             name: &p.machine,
@@ -356,6 +363,7 @@ fn body(
             egress: None,
         })
         .map_err(|e| e.to_string())?;
+    live.created = true;
     live.log.log(&format!(
         "created {} · {} MiB · {} vCPU · runtime {} · no network",
         p.machine,
