@@ -309,16 +309,17 @@ fn parse_run(flags: &[&str]) -> Result<Action, String> {
 }
 
 /// `rts run`: load the session file, apply the launch checks, and run the
-/// headless session. An external provider is recorded as unattested the
-/// same way `rts launch` records it; the attested embedded provider is not
-/// available headless yet.
+/// headless session. An embedded config (no explicit provider) gets rts's
+/// own attested NEAR AI inference, the same forwarder-and-IronWire stack as
+/// `rts launch`, keyed from NEARAI_API_KEY in the environment; an explicit
+/// external provider is recorded unattested behind --allow-unattested-provider.
 fn run_headless_command(
     file: Option<&Path>,
     options: &rts::headless::RunOptions,
     allow_unattested_provider: bool,
 ) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
-    let cfg = if let Some(file) = file {
+    let mut cfg = if let Some(file) = file {
         config::load_config(file, &defaults)?
     } else {
         config::parse_config(
@@ -333,16 +334,91 @@ fn run_headless_command(
         ..Default::default()
     };
     check_launch(&cfg, &env, &attest_options)?;
-    if cfg.embedded_inference {
-        return Err("rts run needs an explicit provider in the session file (provider.id, baseURL, models, apiKeyEnv) and --allow-unattested-provider; the attested embedded provider is not available headless yet".into());
-    }
     if !cfg.network.is_empty() {
         return Err("rts run gives the container no network; remove network.allow from the session file".into());
     }
     let session_id = session::new_session_id();
+    if cfg.embedded_inference {
+        return run_headless_attested(cfg, options, &env, attest_options, session_id);
+    }
     record_unattested(&cfg, &session_id, &attest_options)?;
     let deps = session::Deps::real(session_id, None)?;
     Ok(rts::headless::run_headless(&cfg, options, deps))
+}
+
+/// The inference key for the headless attested path: NEARAI_API_KEY from the
+/// environment, non-empty. There is no interactive sign-in on a headless host.
+fn embedded_inference_key(env: &[(String, String)]) -> Result<String, String> {
+    env.iter()
+        .find(|(k, _)| k == "NEARAI_API_KEY")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            "rts run with the attested embedded provider needs NEARAI_API_KEY in the environment; \
+             set it, or name an external provider in the session file and pass --allow-unattested-provider"
+                .to_string()
+        })
+}
+
+/// The headless attested path: verify NEAR AI's attestation for every model,
+/// start the pinned forwarder and IronWire on host loopback, hand opencode
+/// only that embedded provider, and keep both alive for the whole run. The
+/// inference key is NEARAI_API_KEY from the environment; there is no
+/// interactive sign-in on a headless host. The forwarder's fatal reason ends
+/// the session if re-attestation fails mid-run.
+fn run_headless_attested(
+    mut cfg: config::OperatorConfig,
+    options: &rts::headless::RunOptions,
+    env: &[(String, String)],
+    attest_options: attest::AttestOptions,
+    session_id: String,
+) -> Result<i32, String> {
+    let key = ironwire_proxy::embed::HostSecret::from(embedded_inference_key(env)?);
+
+    let fatal = forwarder::Fatal::new();
+    let record =
+        attest::record::AttestationRecord::create(&cfg.sessions_dir, &session_id, &attest_options)?;
+    let refused = |e: String| {
+        record.set_status("refused", &e);
+        format!("attestation failed: {e} (see {})", record.path().display())
+    };
+    let attestor = Arc::new(
+        attest::Attestor::real(Some(key.clone()), &cfg.provider.models, attest_options)
+            .map_err(refused)?,
+    );
+    let attested = attestor.attest().map_err(refused)?;
+    let (forwarder, inference) = start_connected(
+        &record,
+        attested,
+        |seed| {
+            forwarder::Forwarder::start(forwarder::ForwarderConfig {
+                upstream: inference::NEAR_BASE_URL.into(),
+                models: cfg.provider.models.clone(),
+                roots: forwarder::pin::native_roots()?,
+                seed,
+                reattest: {
+                    let attestor = attestor.clone();
+                    Arc::new(move || attestor.attest())
+                },
+                fatal: fatal.clone(),
+                record: record.clone(),
+                max_request_bytes: 32 << 20,
+                signatures: forwarder::signature::SignaturePolicy::default(),
+                inference_log: record.session_dir().join("inference.jsonl"),
+            })
+        },
+        |forwarder| inference::start_with_endpoint(key, &cfg.provider.models, &forwarder.base_url()),
+    )?;
+    cfg.provider = inference.provider();
+    // IronWire drops before the forwarder it rides on: hold them in Connected.
+    let connected = Connected {
+        _inference: inference,
+        _forwarder: forwarder,
+    };
+    let deps = session::Deps::real(session_id, Some(fatal))?;
+    let code = rts::headless::run_headless(&cfg, options, deps);
+    drop(connected);
+    Ok(code)
 }
 
 fn run_connected<G>(
@@ -733,6 +809,25 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use rts::auth::Provider;
+
+    #[test]
+    fn embedded_inference_key_reads_a_non_empty_nearai_key() {
+        let env = vec![
+            ("PATH".to_string(), "/bin".to_string()),
+            ("NEARAI_API_KEY".to_string(), "sk-live".to_string()),
+        ];
+        assert_eq!(embedded_inference_key(&env).unwrap(), "sk-live");
+    }
+
+    #[test]
+    fn embedded_inference_key_refuses_a_missing_or_empty_key() {
+        let missing = embedded_inference_key(&[("PATH".to_string(), "/bin".to_string())]).unwrap_err();
+        assert!(missing.contains("NEARAI_API_KEY"), "{missing}");
+        assert!(missing.contains("--allow-unattested-provider"), "{missing}");
+        let empty =
+            embedded_inference_key(&[("NEARAI_API_KEY".to_string(), String::new())]).unwrap_err();
+        assert!(empty.contains("NEARAI_API_KEY"), "{empty}");
+    }
 
     fn default_config() -> config::OperatorConfig {
         config::parse_config(

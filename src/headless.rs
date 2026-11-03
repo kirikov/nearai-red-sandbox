@@ -265,6 +265,7 @@ pub fn run_headless(cfg: &OperatorConfig, o: &RunOptions, deps: Deps) -> i32 {
         "image": o.image,
         "runtime": o.runtime,
         "model": format!("{}/{}", cfg.provider.id, cfg.provider.models[0]),
+        "attested": cfg.embedded_inference,
         "opencodeExit": live.opencode_exit,
         "exit": code,
         "reason": reason,
@@ -349,8 +350,13 @@ fn body(
         return Err(why);
     }
     let deadline = Instant::now() + Duration::from_secs(o.timeout_min * 60);
+    let fatal = deps.fatal.clone();
+    // The run ends on the time limit, a signal, or the attested forwarder's
+    // fatal reason (re-attestation failed): inference is gone, so stop.
     let limit = || {
-        (Instant::now() >= deadline).then(|| format!("run-limit: {} minutes passed", o.timeout_min))
+        (Instant::now() >= deadline)
+            .then(|| format!("run-limit: {} minutes passed", o.timeout_min))
+            .or_else(|| crate::session::stop_reason(fatal.as_deref()))
     };
 
     live.attempted = true;
