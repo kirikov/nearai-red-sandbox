@@ -549,6 +549,7 @@ mod tests {
             base_url: "http://127.0.0.1:1/v1".into(),
             models: vec!["test-no-inference".into()],
             api_key_env: None,
+            extra_body: None,
         };
         let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
         write_tui_config(

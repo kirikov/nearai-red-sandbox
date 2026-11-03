@@ -141,6 +141,7 @@ pub fn start_with_endpoint(
             base_url: format!("http://127.0.0.1:{port}/openai/v1"),
             models: models.to_vec(),
             api_key_env: None,
+            extra_body: None,
         },
         shutdown: Some(shutdown),
         finished,

@@ -101,6 +101,11 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         Some(k) => format!("{{env:{k}}}"),
         None => PLACEHOLDER_API_KEY.to_string(),
     };
+    let mut options = json!({ "baseURL": p.base_url, "apiKey": api_key });
+    // Merged by opencode into every request body (max_tokens, chat_template_kwargs, ...).
+    if let Some(extra) = &p.extra_body {
+        options["extraBody"] = extra.clone();
+    }
     json!({
         "$schema": "https://opencode.ai/config.json",
         // v1 tuple form; v2.2.2 normalizes it to { package, options } (core/src/config/normalize.ts).
@@ -110,7 +115,7 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
                 "npm": "@ai-sdk/openai-compatible",
                 // An external provider keeps its own ID as its name.
                 "name": if embedded { PRODUCT_NAME } else { p.id.as_str() },
-                "options": { "baseURL": p.base_url, "apiKey": api_key },
+                "options": options,
                 "models": models,
             }
         },
@@ -1039,7 +1044,7 @@ mod tests {
     }
 
     fn provider() -> ProviderConfig {
-        ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None }
+        ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None, extra_body: None }
     }
 
     /// Run the real initialization command against a miniature guest filesystem.
@@ -2297,7 +2302,7 @@ mod tests {
     #[test]
     fn the_direct_provider_is_plain_openai_compatible_with_the_placeholder_key() {
         let id = crate::config::DIRECT_PROVIDER_ID;
-        let p = ProviderConfig { id: id.into(), base_url: "http://127.0.0.1:1/v1".into(), models: vec!["m".into()], api_key_env: None };
+        let p = ProviderConfig { id: id.into(), base_url: "http://127.0.0.1:1/v1".into(), models: vec!["m".into()], api_key_env: None, extra_body: None };
         let c = opencode_config(Path::new("/p"), &json!({}), &p, true, None);
         // No IronWire route header: the forwarder itself is the provider.
         assert!(c["provider"][id]["models"]["m"].get("headers").is_none(), "{c}");

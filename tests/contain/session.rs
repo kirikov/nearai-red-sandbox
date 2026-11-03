@@ -36,7 +36,7 @@ fn plugin_dir() -> PathBuf {
 }
 
 fn provider() -> ProviderConfig {
-    ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None }
+    ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None, extra_body: None }
 }
 
 struct Session {

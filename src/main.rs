@@ -466,6 +466,7 @@ fn run_headless_attested(
                 base_url: forwarder.base_url(),
                 models: cfg.provider.models.clone(),
                 api_key_env: None,
+                extra_body: None,
             };
             (provider, Connected { _inference: None, _forwarder: forwarder })
         }
@@ -1180,6 +1181,7 @@ mod tests {
                     base_url: "http://127.0.0.1:43210/openai/v1".into(),
                     models: vec!["chosen".into()],
                     api_key_env: None,
+                    extra_body: None,
                 };
                 Ok((provider, Guard(events.clone())))
             },

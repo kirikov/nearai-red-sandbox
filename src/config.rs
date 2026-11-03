@@ -42,6 +42,10 @@ pub struct ProviderConfig {
     /// Environment variable holding the key, for a provider reached
     /// directly. None for IronWire.
     pub api_key_env: Option<String>,
+    /// Extra JSON merged into every chat-completions request body by
+    /// opencode (`options.extraBody`): `max_tokens`, `chat_template_kwargs`
+    /// for a model's thinking switch, and so on. None sends the body as is.
+    pub extra_body: Option<serde_json::Value>,
 }
 
 impl ProviderConfig {
@@ -189,6 +193,7 @@ struct RawProvider {
     base_url: Option<String>,
     models: Option<Vec<String>>,
     api_key_env: Option<String>,
+    extra_body: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -427,11 +432,17 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
     if models.is_empty() || models.iter().any(String::is_empty) {
         return Err("config: provider.models must be a non-empty list of model IDs".into());
     }
+    if let Some(extra) = &p.extra_body
+        && !extra.is_object()
+    {
+        return Err("config: provider.extraBody must be a JSON object".into());
+    }
     let provider = ProviderConfig {
         id,
         base_url,
         models,
         api_key_env: p.api_key_env,
+        extra_body: p.extra_body,
     };
     // Plain http only to loopback: anything else would send prompts in the clear.
     if !provider.base_url.starts_with("https://") && provider.loopback().is_none() {
