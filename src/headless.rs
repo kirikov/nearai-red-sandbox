@@ -233,7 +233,9 @@ pub fn run_headless(cfg: &OperatorConfig, o: &RunOptions, deps: Deps) -> i32 {
     let sb = match DockerSandbox::new(&p.machine, Box::new(runner.clone()))
         .and_then(|sb| sb.with_runtime(o.runtime.clone()))
     {
-        Ok(sb) => sb.with_copy_limits(CopyLimits::default()),
+        Ok(sb) => sb
+            .with_copy_limits(CopyLimits::default())
+            .with_start_timeout(Duration::from_millis(cfg.limits.start_timeout_ms)),
         Err(e) => {
             log.log(&e.to_string());
             return 1;

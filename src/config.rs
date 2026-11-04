@@ -71,6 +71,9 @@ pub struct Limits {
     pub cpus: u32,
     pub host_rss_ceiling_mib: u64,
     pub handshake_ms: u64,
+    /// Budget for `docker start` (and the teardown's `rm -f`) of the container
+    /// backend, in ms. sysbox-runc chowns a large rootfs on the first start.
+    pub start_timeout_ms: u64,
     /// Wall-clock limit from boot, in hours; also the attach `--ttl`.
     pub session_hours: u32,
     /// opencode's context window for the model, in tokens; drives auto-compaction.
@@ -99,6 +102,7 @@ impl Default for Limits {
             cpus: 2,
             host_rss_ceiling_mib: 2048 + RSS_HEADROOM_MIB,
             handshake_ms: 30_000,
+            start_timeout_ms: 900_000,
             session_hours: 24,
             context_tokens: None,
             rss_ceiling_set: false,
@@ -207,6 +211,7 @@ struct RawLimits {
     #[serde(rename = "hostRssCeilingMiB")]
     host_rss_ceiling_mib: Option<u64>,
     handshake_ms: Option<u64>,
+    start_timeout_ms: Option<u64>,
     #[serde(rename = "contextTokens")]
     context_tokens: Option<u64>,
     /// Read as any JSON value so a string or fraction gets this module's
@@ -479,6 +484,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         cpus: positive(l.cpus, dl.cpus, "cpus")?,
         host_rss_ceiling_mib,
         handshake_ms: positive(l.handshake_ms, dl.handshake_ms, "handshakeMs")?,
+        start_timeout_ms: positive(l.start_timeout_ms, dl.start_timeout_ms, "startTimeoutMs")?,
         session_hours: session_hours(l.session_hours.as_ref(), dl.session_hours)?,
         context_tokens: match l.context_tokens {
             Some(n) if n == 0 => return Err("config: limits.contextTokens must be a positive integer".into()),

@@ -32,10 +32,10 @@ use crate::sandbox::{
 };
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(180);
-/// `docker start` and `docker rm -f` of a sysbox-runc container can take
-/// minutes on a large image: without idmapped mounts sysbox chowns the whole
-/// rootfs on the first start (a 650 MB, 35k-file image needed more than 180 s
-/// on dstack, 2026-11-04). They get a longer budget than the other controls.
+/// Default budget for `docker start` and the teardown's `rm -f`: a sysbox-runc
+/// container can take minutes to start on a large image (without idmapped
+/// mounts sysbox chowns the whole rootfs first; a 650 MB, 35k-file image needed
+/// more than 180 s on dstack, 2026-11-04). `limits.startTimeoutMs` overrides it.
 const START_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Processes a container may hold. The guest wrapper spawns a handful per
@@ -102,6 +102,7 @@ pub struct DockerSandbox {
     state: Option<StateDir>,
     dead: Mutex<Option<String>>,
     copy_limits: CopyLimits,
+    start_timeout: Duration,
 }
 
 impl DockerSandbox {
@@ -119,7 +120,14 @@ impl DockerSandbox {
             state: None,
             dead: Mutex::new(None),
             copy_limits: CopyLimits::default(),
+            start_timeout: START_TIMEOUT,
         })
+    }
+
+    /// Budget for `docker start` and the teardown's `rm -f` (`limits.startTimeoutMs`).
+    pub fn with_start_timeout(mut self, t: Duration) -> Self {
+        self.start_timeout = t;
+        self
     }
 
     /// Share the session's state directory: a marker set by any process
@@ -333,7 +341,7 @@ impl Sandbox for DockerSandbox {
             return Err(Error::Unavailable(r));
         }
         self.control(&argv, "docker create")?;
-        self.control_with(&sv(&["start", &self.name]), "docker start", START_TIMEOUT)?;
+        self.control_with(&sv(&["start", &self.name]), "docker start", self.start_timeout)?;
         Ok(())
     }
 
@@ -350,7 +358,7 @@ impl Sandbox for DockerSandbox {
         self.mark_unavailable("sandbox removed");
         let rm = self
             .run
-            .run(&sv(&["rm", "-f", &self.name]), START_TIMEOUT);
+            .run(&sv(&["rm", "-f", &self.name]), self.start_timeout.max(CONTROL_TIMEOUT));
         let ps = self.control(
             &sv(&[
                 "ps",
