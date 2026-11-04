@@ -91,7 +91,11 @@ fn jwks_point(jwks: &[u8], kid: &str) -> Result<Vec<u8>, String> {
 
 /// Verifies `alg == "ES384"`, finds the JWKS key with the token's `kid` (`kty EC`, `crv P-384`),
 /// verifies the 96-byte fixed signature over `header.payload` against `04 || x || y`,
-/// and requires `exp > now_unix`. Returns the kid and the claims.
+/// and requires `exp > now_unix` and `nbf <= now_unix + CLOCK_LEEWAY_SECS`. Returns the kid
+/// and the claims.
+/// Clock skew tolerated on `nbf` (not on `exp`).
+pub const CLOCK_LEEWAY_SECS: u64 = 120;
+
 pub fn verify_es384_jwt(
     token: &str,
     jwks: &[u8],
@@ -130,9 +134,12 @@ pub fn verify_es384_jwt(
         Some(Some(_)) => return Err("NRAS token: expired (exp has passed)".into()),
         _ => return Err("NRAS token: exp is missing or not a non-negative integer".into()),
     }
+    // NRAS issues nbf == iat, so a verifier whose clock runs a few seconds
+    // behind NVIDIA's would refuse every fresh token without a leeway (RFC 7519
+    // §4.1.5 allows one); exp keeps no leeway, a token is never accepted late.
     match claims.get("nbf").map(Value::as_u64) {
         None => {}
-        Some(Some(nbf)) if nbf <= now_unix => {}
+        Some(Some(nbf)) if nbf <= now_unix + CLOCK_LEEWAY_SECS => {}
         Some(_) => return Err("NRAS token: nbf is in the future or not an integer".into()),
     }
     Ok((kid, Value::Object(claims)))
@@ -196,7 +203,8 @@ impl GpuVerifier for NrasGpuVerifier {
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuVerdict, GpuVerifier, NRAS_ATTEST_URL, NRAS_JWKS_URL, NrasGpuVerifier, verify_es384_jwt,
+        CLOCK_LEEWAY_SECS, GpuVerdict, GpuVerifier, NRAS_ATTEST_URL, NRAS_JWKS_URL,
+        NrasGpuVerifier, verify_es384_jwt,
     };
     use crate::attest::http::{FakeHttp, FixedClock, HttpResponse};
     use base64::Engine;
@@ -332,6 +340,25 @@ mod tests {
             let e = verify_es384_jwt(&t, &jwks("k1", &a), NOW).unwrap_err();
             assert!(e.contains("exp"), "{c}: {e}");
         }
+    }
+
+    #[test]
+    fn nbf_tolerates_the_clock_leeway_but_not_more() {
+        let a = key(A);
+        for (nbf, accepted) in [
+            (NOW, true),
+            (NOW + CLOCK_LEEWAY_SECS, true),
+            (NOW + CLOCK_LEEWAY_SECS + 1, false),
+        ] {
+            let c = json!({"exp": NOW + 3600, "nbf": nbf, "x-nvidia-overall-att-result": true});
+            let r = verify_es384_jwt(&token(&a, header(), c), &jwks("k1", &a), NOW);
+            assert_eq!(r.is_ok(), accepted, "nbf = NOW + {}: {r:?}", nbf - NOW);
+            if !accepted {
+                assert!(r.unwrap_err().contains("nbf"));
+            }
+        }
+        let c = json!({"exp": NOW + 3600, "nbf": "soon", "x-nvidia-overall-att-result": true});
+        assert!(verify_es384_jwt(&token(&a, header(), c), &jwks("k1", &a), NOW).is_err());
     }
 
     #[test]
