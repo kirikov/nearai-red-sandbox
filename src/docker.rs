@@ -32,6 +32,11 @@ use crate::sandbox::{
 };
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(180);
+/// `docker start` and `docker rm -f` of a sysbox-runc container can take
+/// minutes on a large image: without idmapped mounts sysbox chowns the whole
+/// rootfs on the first start (a 650 MB, 35k-file image needed more than 180 s
+/// on dstack, 2026-11-04). They get a longer budget than the other controls.
+const START_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Processes a container may hold. The guest wrapper spawns a handful per
 /// tool call; a repository's test suite can fan out, but a fork bomb must
@@ -176,9 +181,13 @@ impl DockerSandbox {
     }
 
     fn control(&self, argv: &[String], what: &str) -> Result<RunOutput> {
+        self.control_with(argv, what, CONTROL_TIMEOUT)
+    }
+
+    fn control_with(&self, argv: &[String], what: &str, timeout: Duration) -> Result<RunOutput> {
         let r = self
             .run
-            .run(argv, CONTROL_TIMEOUT)
+            .run(argv, timeout)
             .map_err(|e| Error::Other(format!("{what} failed: {e}")))?;
         if r.killed {
             return Err(Error::Other(format!("{what} timed out")));
@@ -324,7 +333,7 @@ impl Sandbox for DockerSandbox {
             return Err(Error::Unavailable(r));
         }
         self.control(&argv, "docker create")?;
-        self.control(&sv(&["start", &self.name]), "docker start")?;
+        self.control_with(&sv(&["start", &self.name]), "docker start", START_TIMEOUT)?;
         Ok(())
     }
 
@@ -341,7 +350,7 @@ impl Sandbox for DockerSandbox {
         self.mark_unavailable("sandbox removed");
         let rm = self
             .run
-            .run(&sv(&["rm", "-f", &self.name]), CONTROL_TIMEOUT);
+            .run(&sv(&["rm", "-f", &self.name]), START_TIMEOUT);
         let ps = self.control(
             &sv(&[
                 "ps",
