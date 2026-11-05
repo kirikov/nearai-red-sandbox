@@ -265,3 +265,45 @@ fn a_removed_container_is_gone_even_when_exec_is_mid_flight() {
     m.0.remove().unwrap();
     assert!(m.unavailable());
 }
+
+#[test]
+#[ignore = "real docker"]
+fn a_guest_process_that_rewrites_out_does_not_change_the_reviewers_files() {
+    let h = harness();
+    let m = fresh(h);
+    initialize_guest_storage(&*m).expect("guest layout");
+    // A co-resident guest process (the buyer's ENTRYPOINT, or a test the
+    // reviewer runs) forges the verdict in a loop.
+    let r = DockerRunner { docker: h.docker.clone() }
+        .run(
+            &sv(&["exec", "-d", &m.name, "sh", "-c",
+                "while :; do echo forged > /out/verdict.json; echo forged > /out/findings.md; sleep 0.05; done"]),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    assert_eq!(r.code, Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+    let record = tempdir("record");
+    let tools = rts::tools::Tools {
+        sb: &*m,
+        limits: rts::tools::ToolLimits {
+            timeout_ms: 120_000,
+            max_output_bytes: 65_536,
+            cwd: "/".into(),
+            leak_shell: false,
+            proxy: false,
+            record: Some(record.clone()),
+        },
+    };
+    let verdict = "{\"findings\":[{\"id\":\"F-01\",\"severity\":\"high\"}]}";
+    tools.call("write", &serde_json::json!({"path": "/out/verdict.json", "content": verdict})).unwrap();
+    tools.call("write", &serde_json::json!({"path": "/out/findings.md", "content": "# F-01 high"})).unwrap();
+    tools.call("edit", &serde_json::json!({"path": "/out/findings.md", "oldString": "high", "newString": "critical"})).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let outputs = std::env::temp_dir().join(format!("rts-container-out-{}", random_hex(4)));
+    m.copy_out("/out", &outputs).expect("copy out");
+    assert_eq!(std::fs::read_to_string(outputs.join("verdict.json")).unwrap().trim(), "forged");
+    let doc = rts::record::overlay(&rts::record::Record::new(&record), &outputs).unwrap();
+    assert_eq!(std::fs::read_to_string(outputs.join("verdict.json")).unwrap(), verdict);
+    assert_eq!(std::fs::read_to_string(outputs.join("findings.md")).unwrap(), "# F-01 critical");
+    assert_eq!(doc["guestCopyDiffered"], serde_json::json!(["findings.md", "verdict.json"]));
+}

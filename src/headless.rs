@@ -82,6 +82,7 @@ pub fn plugin_options(
         "stateDir": p.state_dir,
         "timeoutMs": cfg.limits.tool_timeout_ms,
         "maxOutputBytes": cfg.limits.max_output_bytes,
+        "recordDir": record_dir(p),
     });
     if let Some(d) = &o.docker {
         bridge["docker"] = json!(d);
@@ -99,6 +100,12 @@ pub fn plugin_options(
         "rts": rts,
         "bridge": bridge,
     })
+}
+
+/// Where the host keeps the reviewer's copy of /out: the runtime dir, never
+/// inside the guest and never in the results until the export.
+pub fn record_dir(p: &SessionPaths) -> PathBuf {
+    p.runtime.join("record")
 }
 
 /// Read the prompt: UTF-8, non-blank, at most [`MAX_PROMPT_BYTES`].
@@ -149,6 +156,8 @@ struct Live<'a> {
     created: bool,
     child: Option<Child>,
     opencode_exit: Option<i32>,
+    /// out-provenance.json, once the recorded files replaced the export.
+    provenance: Option<Value>,
 }
 
 impl Live<'_> {
@@ -192,6 +201,25 @@ impl Live<'_> {
                     }
                     Err(e) => self.log.log(&format!("teardown: EXPORT FAILED: {e}")),
                 }
+            }
+        }
+        // The reviewer's own writes win over the guest's copy, exported or not.
+        if self.created {
+            let rec = crate::record::Record::new(record_dir(self.paths));
+            match crate::record::overlay(&rec, &self.paths.out_dir) {
+                Ok(doc) => {
+                    let differed = doc["guestCopyDiffered"].as_array().map_or(0, Vec::len);
+                    let n = doc["files"].as_object().map_or(0, |m| m.values().filter(|v| v["source"] != "guest").count());
+                    self.log.log(&format!(
+                        "teardown: {n} files from the reviewer's recorded writes; the guest's copy differed for {differed}"
+                    ));
+                    let path = self.paths.session_dir.join("out-provenance.json");
+                    if let Err(e) = fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n") {
+                        self.log.log(&format!("teardown: cannot write {}: {e}", path.display()));
+                    }
+                    self.provenance = Some(doc);
+                }
+                Err(e) => self.log.log(&format!("teardown: RECORDED OUT FAILED: {e}")),
             }
         }
         // A failed create may still have left a container: remove either way.
@@ -251,6 +279,7 @@ pub fn run_headless(cfg: &OperatorConfig, o: &RunOptions, deps: Deps) -> i32 {
         created: false,
         child: None,
         opencode_exit: None,
+        provenance: None,
     };
     let outcome = body(cfg, o, &deps, &runner, &mut live);
     let (code, reason) = match &outcome {
@@ -277,6 +306,10 @@ pub fn run_headless(cfg: &OperatorConfig, o: &RunOptions, deps: Deps) -> i32 {
             CopyOutResult::Exported { files, bytes } => json!({ "files": files, "bytes": bytes }),
             CopyOutResult::NothingToExport => json!({ "files": 0, "bytes": 0 }),
         }),
+        "outProvenance": live.provenance.as_ref().map(|d| json!({
+            "file": "out-provenance.json",
+            "guestCopyDiffered": d["guestCopyDiffered"],
+        })),
     });
     if let Err(e) = fs::write(
         &p.session_record,

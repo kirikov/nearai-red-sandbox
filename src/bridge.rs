@@ -69,6 +69,9 @@ pub struct BridgeOptions {
     /// Network session: `shell` runs under the guest proxy environment.
     #[serde(default)]
     pub proxy: bool,
+    /// Host directory for the reviewer's copy of /out (`record::Record`).
+    #[serde(default)]
+    pub record_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +116,9 @@ pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
     if o.timeout_ms == 0 || o.max_output_bytes == 0 {
         return Err("bad tool request: timeoutMs and maxOutputBytes must be positive".into());
     }
+    if o.record_dir.as_ref().is_some_and(|d| !d.is_absolute()) {
+        return Err("bad tool request: recordDir must be an absolute host path".into());
+    }
     if let Some(cwd) = &o.cwd
         && !cwd.starts_with('/')
     {
@@ -151,6 +157,7 @@ pub fn call(
         cwd: o.cwd.clone().unwrap_or_else(|| "/".into()),
         leak_shell,
         proxy: o.proxy,
+        record: o.record_dir.clone(),
     };
     match (Tools { sb, limits }).call(tool, input) {
         Ok(text) => Outcome::ok(text),

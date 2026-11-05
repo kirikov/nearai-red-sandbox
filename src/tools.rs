@@ -1,6 +1,7 @@
 //! The six sandboxed tools. Every effect goes through `Exec`; nothing here
 //! touches the host filesystem or spawns a host process, except the
-//! explicit leak seam used only by the leak-detection test.
+//! explicit leak seam used only by the leak-detection test, and the host's
+//! copy of what the reviewer writes under /out (`record`).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -8,6 +9,7 @@ use serde_json::Value;
 
 use crate::files::{GuestRead, guest_read, guest_write, script};
 use crate::glob::glob_match;
+use crate::record::{Record, rel_under_out};
 use crate::sandbox::{Error, Exec, ExecOptions, Result, sv};
 
 pub const SANDBOXED_TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "glob", "grep"];
@@ -24,6 +26,9 @@ pub struct ToolLimits {
     /// Network session: run `shell` under the guest proxy environment
     /// (`network::proxy_env`), which `machine exec` does not inherit.
     pub proxy: bool,
+    /// Host directory that keeps the reviewer's own copy of every `write`
+    /// and `edit` under /out (`record::Record`); None records nothing.
+    pub record: Option<PathBuf>,
 }
 
 const READ_LINE_CAP: usize = 2000;
@@ -191,9 +196,23 @@ impl Tools<'_> {
         }
     }
 
+    /// The record and the path under /out, when this path is recorded.
+    fn recorded<'p>(&self, path: &'p str) -> Option<(Record, &'p str)> {
+        let dir = self.limits.record.as_ref()?;
+        Some((Record::new(dir), rel_under_out(path)?))
+    }
+
+    fn keep(&self, path: &str, data: &[u8], guest_base: bool) -> Result<()> {
+        if let Some((rec, rel)) = self.recorded(path) {
+            rec.put(rel, data, guest_base).map_err(|e| Error::Other(format!("recording {path} on the host failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     pub fn write(&self, input: &Value) -> Result<String> {
         let path = self.path(input, "path")?;
         let content = str_field(input, "content").ok_or("content is required")?;
+        self.keep(&path, content.as_bytes(), false)?;
         guest_write(self.sb, &path, content.as_bytes())?;
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
@@ -207,8 +226,22 @@ impl Tools<'_> {
             return Err("oldString and newString are identical".into());
         }
         let replace_all = is_true(input, "replaceAll");
+        // A file the reviewer wrote is edited from the host's copy: the
+        // guest's copy may have been rewritten since.
+        if let Some(t) = self.recorded(&path).and_then(|(rec, rel)| rec.get(rel)) {
+            if old.is_empty() {
+                return Err("oldString is empty; use write to replace a whole file".into());
+            }
+            let t = String::from_utf8(t).map_err(|_| Error::Other("file is not valid UTF-8; edit refused".into()))?;
+            let n = if replace_all { count_matches(&t, old) } else { 1 };
+            let updated = apply_edit(&t, old, new, replace_all)?;
+            self.keep(&path, updated.as_bytes(), false)?;
+            guest_write(self.sb, &path, updated.as_bytes())?;
+            return Ok(format!("edited {path}: {n} replacement{}", if n == 1 { "" } else { "s" }));
+        }
         match guest_read(self.sb, &path, self.limits.max_output_bytes)? {
             GuestRead::Missing if old.is_empty() => {
+                self.keep(&path, new.as_bytes(), false)?;
                 guest_write(self.sb, &path, new.as_bytes())?;
                 Ok(format!("created {path}"))
             }
@@ -220,6 +253,7 @@ impl Tools<'_> {
                 let t = String::from_utf8(data).map_err(|_| Error::Other("file is not valid UTF-8; edit refused".into()))?;
                 let n = if replace_all { count_matches(&t, old) } else { 1 };
                 let updated = apply_edit(&t, old, new, replace_all)?;
+                self.keep(&path, updated.as_bytes(), true)?;
                 guest_write(self.sb, &path, updated.as_bytes())?;
                 Ok(format!("edited {path}: {n} replacement{}", if n == 1 { "" } else { "s" }))
             }
@@ -313,7 +347,7 @@ mod tests {
     use serde_json::json;
 
     fn lim() -> ToolLimits {
-        ToolLimits { timeout_ms: 120_000, max_output_bytes: 65536, cwd: "/".into(), leak_shell: false, proxy: false }
+        ToolLimits { timeout_ms: 120_000, max_output_bytes: 65536, cwd: "/".into(), leak_shell: false, proxy: false, record: None }
     }
     fn file_reply(data: &[u8], size: Option<u64>) -> ExecResult {
         let mut out = format!("F {}\n", size.unwrap_or(data.len() as u64)).into_bytes();
@@ -445,6 +479,42 @@ mod tests {
         let a = rec.argvs();
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(a[0].last().unwrap()).unwrap(), "héllo".as_bytes());
         assert_eq!(a.last().unwrap().last().unwrap(), "/out/a.txt");
+    }
+
+    #[test]
+    fn writes_under_out_are_recorded_on_the_host_and_others_are_not() {
+        let t = tempfile::tempdir().unwrap();
+        let rec = Recorder::new(|_, _| ok(b""));
+        let l = ToolLimits { record: Some(t.path().to_path_buf()), ..lim() };
+        run(&rec, l.clone(), "write", json!({"path": "/out/verdict.json", "content": "{}"})).unwrap();
+        run(&rec, l, "write", json!({"path": "/tmp/x", "content": "y"})).unwrap();
+        let r = crate::record::Record::new(t.path());
+        assert_eq!(r.get("verdict.json").unwrap(), b"{}");
+        assert_eq!(r.list(), vec!["verdict.json".to_string()]);
+    }
+
+    #[test]
+    fn an_edit_of_a_recorded_file_ignores_the_guest_copy() {
+        let t = tempfile::tempdir().unwrap();
+        let r = crate::record::Record::new(t.path());
+        r.put("findings.md", b"high: F-01", false).unwrap();
+        // The guest rewrote its copy; the edit must not start from it.
+        let rec = Recorder::new(|a, _| if is_read(a) { file_reply(b"no findings", None) } else { ok(b"") });
+        let l = ToolLimits { record: Some(t.path().to_path_buf()), ..lim() };
+        run(&rec, l, "edit", json!({"path": "/out/findings.md", "oldString": "high", "newString": "critical"})).unwrap();
+        assert_eq!(r.get("findings.md").unwrap(), b"critical: F-01");
+        assert!(rec.argvs().iter().all(|a| !is_read(a)));
+    }
+
+    #[test]
+    fn an_edit_of_a_guest_produced_file_is_recorded_as_such() {
+        let t = tempfile::tempdir().unwrap();
+        let rec = Recorder::new(|a, _| if is_read(a) { file_reply(b"log a", None) } else { ok(b"") });
+        let l = ToolLimits { record: Some(t.path().to_path_buf()), ..lim() };
+        run(&rec, l, "edit", json!({"path": "/out/log.txt", "oldString": "a", "newString": "b"})).unwrap();
+        let out = t.path().join("export");
+        let doc = crate::record::overlay(&crate::record::Record::new(t.path()), &out).unwrap();
+        assert_eq!(doc["files"]["log.txt"]["source"], "reviewer-edit-of-guest-file");
     }
 
     #[test]
